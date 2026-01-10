@@ -22,7 +22,9 @@ load_dotenv()
 st.set_page_config(page_title="O-1 PDF Highlighter", layout="wide")
 
 st.title("O-1 PDF Highlighter")
-st.caption("Upload PDFs → choose criteria → approve/reject quotes → export criterion-specific highlighted PDFs")
+st.caption(
+    "Upload PDFs → choose criteria → approve/reject quotes → export criterion-specific highlighted PDFs"
+)
 
 # -------------------------
 # Case setup (sidebar)
@@ -32,16 +34,25 @@ with st.sidebar:
     beneficiary_name = st.text_input("Beneficiary full name", value="")
     variants_raw = st.text_input("Name variants (comma-separated)", value="")
     beneficiary_variants = [v.strip() for v in variants_raw.split(",") if v.strip()]
+
     st.subheader("Manual metadata (optional but improves outputs)")
-    source_url = st.text_input("Source URL (exact text as shown in PDF page 1)", value="")
-    venue_name = st.text_input("Venue / organisation name (for criteria 2/4)", value="")
+    source_url = st.text_input(
+        "Source URL (exact text as shown in PDF page 1)", value=""
+    )
+    venue_name = st.text_input(
+        "Venue / organisation name (for criteria 2/4)", value=""
+    )
     org_name = st.text_input("Organisation name (for criterion 6)", value="")
-    performance_date = st.text_input("Performance date (exact text as shown in PDF)", value="")
-    salary_amount = st.text_input("Salary amount (for criterion 7) – e.g. $10,000", value="")
+    performance_date = st.text_input(
+        "Performance date (exact text as shown in PDF)", value=""
+    )
+    salary_amount = st.text_input(
+        "Salary amount (for criterion 7) – e.g. $10,000", value=""
+    )
 
     st.subheader("Select O-1 criteria to extract")
-    default_criteria = ["2_past", "2_future", "3", "4_past", "4_future"] # sensible defaults for musicians
-    selected_criteria_ids = []
+    default_criteria = ["2_past", "2_future", "3", "4_past", "4_future"]
+    selected_criteria_ids: list[str] = []
     for cid, desc in CRITERIA.items():
         checked = st.checkbox(f"({cid}) {desc}", value=(cid in default_criteria))
         if checked:
@@ -96,7 +107,6 @@ if "meta_by_file" not in st.session_state:
 # -------------------------
 st.subheader("🧾 Metadata (optional but improves highlighting)")
 
-# Global defaults (apply to all PDFs unless overridden)
 with st.expander("Batch defaults (apply to all PDFs)", expanded=True):
     default_source_url = st.text_input("Default source URL (optional)", value="")
     default_venue_name = st.text_input("Default venue / organization name (optional)", value="")
@@ -110,7 +120,6 @@ global_defaults = {
     "salary_amount": default_salary_amount.strip() or None,
 }
 
-# Optional CSV workflow
 with st.expander("CSV metadata (optional bulk mode)", expanded=False):
     filenames = [f.name for f in uploaded_files]
     template_bytes = make_csv_template(filenames)
@@ -142,7 +151,6 @@ csv_data = st.session_state.get("csv_metadata")
 
 # Compute and store resolved metadata per file
 for f in uploaded_files:
-    # Auto-detect from first page
     first_page_text = extract_first_page_text_from_pdf_bytes(f.getvalue())
     auto = extract_first_page_signals(first_page_text)
 
@@ -160,7 +168,6 @@ for f in uploaded_files:
     with st.expander(f"Metadata overrides for: {f.name}", expanded=False):
         st.caption("Leave blank to use CSV/global defaults/auto-detection.")
 
-        # we write overrides back into session_state
         o = dict(overrides)
 
         o["source_url"] = st.text_input(
@@ -187,7 +194,6 @@ for f in uploaded_files:
             key=f"money_{f.name}",
         ).strip()
 
-        # store only non-empty override values
         st.session_state["overrides_by_file"][f.name] = {k: v for k, v in o.items() if v}
 
         st.write("Resolved metadata preview:")
@@ -224,11 +230,10 @@ if run_ai:
             )
             st.session_state["ai_by_file"][f.name] = data
 
-            # Initialize approvals: approve everything initially
             if f.name not in st.session_state["approval"]:
                 st.session_state["approval"][f.name] = {}
             for cid in selected_criteria_ids:
-                items = data["by_criterion"].get(cid, [])
+                items = data.get("by_criterion", {}).get(cid, [])
                 st.session_state["approval"][f.name][cid] = {it["quote"]: True for it in items}
 
     st.success("Done. Review and approve/reject per criterion below.")
@@ -255,7 +260,6 @@ for f in uploaded_files:
 
     by_criterion = data.get("by_criterion", {})
 
-    # Regenerate with feedback (per PDF) – lightweight steering
     regen_col1, regen_col2 = st.columns([1, 3])
     with regen_col1:
         regen_btn = st.button("Regenerate with my feedback", key=f"regen_{f.name}")
@@ -263,7 +267,6 @@ for f in uploaded_files:
         st.caption("Tip: Reject weak quotes, then regenerate to tighten results for this PDF.")
 
     if regen_btn:
-        # Build compact feedback examples across selected criteria
         approved_examples = []
         rejected_examples = []
         for cid in selected_criteria_ids:
@@ -288,10 +291,9 @@ for f in uploaded_files:
 
         st.session_state["ai_by_file"][f.name] = new_data
 
-        # reset approvals to True for new candidates
         st.session_state["approval"][f.name] = {}
         for cid in selected_criteria_ids:
-            items = new_data["by_criterion"].get(cid, [])
+            items = new_data.get("by_criterion", {}).get(cid, [])
             st.session_state["approval"][f.name][cid] = {it["quote"]: True for it in items}
 
         st.success("Regenerated. Review the updated lists below.")
@@ -302,12 +304,14 @@ for f in uploaded_files:
         crit_desc = CRITERIA.get(cid, "")
         items = by_criterion.get(cid, [])
 
-        with st.expander(f"{crit_title}: {crit_desc}", expanded=(cid.startswith(("2", "4")) or cid == "3"):
+        with st.expander(
+            f"{crit_title}: {crit_desc}",
+            expanded=(cid.startswith(("2", "4")) or cid == "3"),
+        ):
             if not items:
                 st.write("No candidates found for this criterion in this document.")
                 continue
 
-            # bulk actions
             b1, b2, b3 = st.columns([1, 1, 2])
             with b1:
                 if st.button("Approve all", key=f"approve_all_{f.name}_{cid}"):
@@ -343,7 +347,6 @@ st.subheader("3️⃣ Export highlighted PDFs by criterion")
 
 
 def build_annotated_pdf_bytes(pdf_bytes: bytes, quotes: list[str], criterion_id: str, filename: str):
-    # Use resolved per-file metadata from Mode B, but also include beneficiary info
     resolved = st.session_state["meta_by_file"].get(filename, {}) or {}
 
     meta = {
@@ -352,7 +355,6 @@ def build_annotated_pdf_bytes(pdf_bytes: bytes, quotes: list[str], criterion_id:
         "org_name": resolved.get("org_name") or org_name,
         "performance_date": resolved.get("performance_date") or performance_date,
         "salary_amount": resolved.get("salary_amount") or salary_amount,
-
         "beneficiary_name": beneficiary_name,
         "beneficiary_variants": beneficiary_variants,
     }
@@ -375,9 +377,16 @@ if zip_btn:
                 approved_quotes = [q for q, ok in approvals.items() if ok]
                 if not approved_quotes:
                     continue
-                out_bytes, report = build_annotated_pdf_bytes(f.getvalue(), approved_quotes, cid, filename=f.name)
+
+                out_bytes, report = build_annotated_pdf_bytes(
+                    f.getvalue(),
+                    approved_quotes,
+                    cid,
+                    filename=f.name,
+                )
                 out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
                 zf.writestr(out_name, out_bytes)
+
     zip_buffer.seek(0)
 
 if zip_buffer:
@@ -402,29 +411,29 @@ for f in uploaded_files:
         approved_quotes = [q for q, ok in approvals.items() if ok]
         if not approved_quotes:
             continue
-        
+
         if st.button(f"Generate PDF for Criterion {cid}", key=f"gen_{f.name}_{cid}"):
             with st.spinner("Annotating…"):
-        out_bytes, report = build_annotated_pdf_bytes(
-            f.getvalue(),
-            approved_quotes,
-            cid,
-            filename=f.name,
-        )
+                out_bytes, report = build_annotated_pdf_bytes(
+                    f.getvalue(),
+                    approved_quotes,
+                    cid,
+                    filename=f.name,
+                )
 
-    out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
+            out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
 
-    st.success(
-        f"Created {out_name} — quotes: {report.get('total_quote_hits', 0)} | meta: {report.get('total_meta_hits', 0)}"
-    )
+            st.success(
+                f"Created {out_name} — quotes: {report.get('total_quote_hits', 0)} | meta: {report.get('total_meta_hits', 0)}"
+            )
 
-    st.download_button(
-        f"⬇️ Download {out_name}",
-        data=out_bytes,
-        file_name=out_name,
-        mime="application/pdf",
-        key=f"dl_{f.name}_{cid}",
-    )
+            st.download_button(
+                f"⬇️ Download {out_name}",
+                data=out_bytes,
+                file_name=out_name,
+                mime="application/pdf",
+                key=f"dl_{f.name}_{cid}",
+            )
 
 st.divider()
 st.caption("O-1 PDF Highlighter • Criterion-based extraction + approval workflow + per-criterion exports")
