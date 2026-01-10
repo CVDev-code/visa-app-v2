@@ -56,7 +56,7 @@ INK_DELTA_GUTTER_BONUS = 12   # ignore light-grey noise in gutters
 # ============================================================
 # Text column envelope behaviour
 # ============================================================
-TEXT_COLUMN_BUFFER_X = 15.0   # expands the no-go column left/right
+TEXT_COLUMN_BUFFER_X = 15.0     # expands the no-go column left/right
 SIDE_ZONE_GAP_FROM_TEXT = 10.0  # distance from envelope to start of side zones
 MIN_SIDE_ZONE_W = 55.0
 MIN_ZONE_H = 55.0
@@ -313,15 +313,15 @@ def _page_drawings(page: fitz.Page) -> List[fitz.Rect]:
 def _page_blockers(page: fitz.Page) -> List[fitz.Rect]:
     blockers: List[fitz.Rect] = []
 
-    # Blocks are often huge; keep their padding small.
+    # Blocks are often huge; keep padding small.
     for r in _page_text_blocks(page):
         blockers.append(inflate_rect(r, GAP_FROM_TEXT_BLOCKS))
 
-    # Words are more precise; light padding.
+    # Words are precise; light padding.
     for r in _page_word_rects(page):
         blockers.append(inflate_rect(r, GAP_FROM_WORDS))
 
-    # Lines are already padded; optionally add minimal padding.
+    # Lines are already padded.
     for r in _page_line_rects(page):
         blockers.append(inflate_rect(r, GAP_FROM_LINES))
 
@@ -404,15 +404,11 @@ def _build_zones_from_envelope(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
             zones.append((name, rr))
 
     if env:
-        # Left / Right zones outside the text column
         _add_zone("left", fitz.Rect(safe.x0, safe.y0, env.x0 - SIDE_ZONE_GAP_FROM_TEXT, safe.y1))
         _add_zone("right", fitz.Rect(env.x1 + SIDE_ZONE_GAP_FROM_TEXT, safe.y0, safe.x1, safe.y1))
-
-        # Top / Bottom as secondary
-        _add_zone("top", fitz.Rect(safe.x0, safe.y0, safe.x1, env.y0 - 10.0), min_w=MIN_SIDE_ZONE_W, min_h=MIN_TOPBOTTOM_H)
-        _add_zone("bottom", fitz.Rect(safe.x0, env.y1 + 10.0, safe.x1, safe.y1), min_w=MIN_SIDE_ZONE_W, min_h=MIN_TOPBOTTOM_H)
+        _add_zone("top", fitz.Rect(safe.x0, safe.y0, safe.x1, env.y0 - 10.0), min_h=MIN_TOPBOTTOM_H)
+        _add_zone("bottom", fitz.Rect(safe.x0, env.y1 + 10.0, safe.x1, safe.y1), min_h=MIN_TOPBOTTOM_H)
     else:
-        # No envelope: generic zones
         _add_zone("left", fitz.Rect(safe.x0, safe.y0, safe.x0 + 140.0, safe.y1))
         _add_zone("right", fitz.Rect(safe.x1 - 140.0, safe.y0, safe.x1, safe.y1))
         _add_zone("top", fitz.Rect(safe.x0, safe.y0, safe.x1, safe.y0 + 110.0), min_h=MIN_TOPBOTTOM_H)
@@ -430,7 +426,6 @@ def _choose_best_spot(page: fitz.Page, targets: List[fitz.Rect], occupied_callou
     tc = _center(target_union)
     pr = page.rect
 
-    # Hard "no-go" text column
     env = _text_envelope(page)
     text_column_blocker = None
     if env:
@@ -484,7 +479,6 @@ def _choose_best_spot(page: fitz.Page, targets: List[fitz.Rect], occupied_callou
         candidates.sort(key=lambda x: x[0])
         return candidates
 
-    # Side first (forced)
     res = find_in_zones(side_zones)
     if not res:
         res = find_in_zones(other_zones)
@@ -492,7 +486,7 @@ def _choose_best_spot(page: fitz.Page, targets: List[fitz.Rect], occupied_callou
     if res:
         return res[0][1], res[0][2], res[0][3], res[0][4]
 
-    # Packed fallback that avoids stacking on top of each other
+    # Packed fallback
     fs, wrapped, w, h = _optimize_layout(label, 150.0)
     safe = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
     occ_buf2 = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied_callouts]
@@ -667,7 +661,7 @@ def annotate_pdf_bytes(
             align=fitz.TEXT_ALIGN_LEFT,
         )
 
-        # Connector obstacles
+        # Connector obstacles (avoid crossing text and existing callouts)
         obstacles: List[fitz.Rect] = []
         for r in _page_text_blocks(page1):
             obstacles.append(inflate_rect(r, 1.5))
@@ -677,8 +671,9 @@ def annotate_pdf_bytes(
             obstacles.append(inflate_rect(r, 1.0))
         for o in occupied_callouts:
             obstacles.append(inflate_rect(o, 2.0))
-        for hb in highlight_blockers := [inflate_rect(t, 2.5) for t in targets]:
-            obstacles.append(hb)
+
+        highlight_obs = [inflate_rect(t, 2.5) for t in targets]
+        obstacles.extend(highlight_obs)
 
         def connect_to(rect: fitz.Rect):
             _draw_straight_connector(page1, callout_rect, rect, obstacles)
