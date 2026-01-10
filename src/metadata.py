@@ -1,11 +1,18 @@
+import csv
+import io
 import json
 import os
+import re
 from typing import Dict, Optional
 
 from openai import OpenAI
 
 
+# -----------------------------
+# Secrets helper
+# -----------------------------
 def _get_secret(name: str):
+    # Works on Streamlit Cloud (st.secrets) and locally (.env / env vars)
     try:
         import streamlit as st
         if name in st.secrets:
@@ -15,12 +22,118 @@ def _get_secret(name: str):
     return os.getenv(name)
 
 
-SYSTEM = """You extract structured metadata from USCIS O-1 evidence PDFs.
-Return ONLY valid JSON.
-If a field is not found, return an empty string for that field.
-"""
+# ============================================================
+# PART A: Mode B helpers (CSV + merge + basic first-page signals)
+# ============================================================
 
-USER = """Extract metadata from the following document text.
+URL_REGEX = re.compile(r"(https?://[^\s)>\]]+)", re.IGNORECASE)
+
+
+def extract_first_page_signals(first_page_text: str) -> Dict:
+    """
+    Lightweight non-AI extraction from page-1 text.
+    Returns dict with any fields we can guess reliably.
+    """
+    text = first_page_text or ""
+    url = ""
+    m = URL_REGEX.search(text)
+    if m:
+        url = m.group(1).strip().rstrip(".,);]")
+
+    return {
+        "source_url": url or None,
+        # Keep these blank unless you add better regexes later
+        "venue_name": None,
+        "performance_date": None,
+        "salary_amount": None,
+        "org_name": None,
+    }
+
+
+def make_csv_template(filenames: list[str]) -> bytes:
+    """
+    Produces a CSV template for bulk metadata entry.
+    Columns are intentionally simple.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["filename", "source_url", "venue_name", "performance_date", "org_name", "salary_amount"])
+    for fn in filenames:
+        writer.writerow([fn, "", "", "", "", ""])
+    return buf.getvalue().encode("utf-8")
+
+
+def parse_metadata_csv(csv_bytes: bytes) -> Dict[str, Dict]:
+    """
+    Parses uploaded CSV and returns:
+      { filename: {source_url, venue_name, performance_date, org_name, salary_amount} }
+    """
+    text = csv_bytes.decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+
+    required = {"filename", "source_url", "venue_name", "performance_date", "org_name", "salary_amount"}
+    if not required.issubset(set(reader.fieldnames or [])):
+        raise ValueError(f"CSV must include headers: {sorted(required)}")
+
+    out: Dict[str, Dict] = {}
+    for row in reader:
+        fn = (row.get("filename") or "").strip()
+        if not fn:
+            continue
+        out[fn] = {
+            "source_url": (row.get("source_url") or "").strip() or None,
+            "venue_name": (row.get("venue_name") or "").strip() or None,
+            "performance_date": (row.get("performance_date") or "").strip() or None,
+            "org_name": (row.get("org_name") or "").strip() or None,
+            "salary_amount": (row.get("salary_amount") or "").strip() or None,
+        }
+    return out
+
+
+def merge_metadata(
+    filename: str,
+    auto: Optional[Dict] = None,
+    global_defaults: Optional[Dict] = None,
+    csv_data: Optional[Dict[str, Dict]] = None,
+    overrides: Optional[Dict] = None,
+) -> Dict:
+    """
+    Merge priority (highest wins):
+      overrides > csv row > global defaults > auto
+    """
+    auto = auto or {}
+    global_defaults = global_defaults or {}
+    overrides = overrides or {}
+    row = (csv_data or {}).get(filename, {}) if csv_data else {}
+
+    def pick(key: str):
+        return (
+            overrides.get(key)
+            or row.get(key)
+            or global_defaults.get(key)
+            or auto.get(key)
+            or None
+        )
+
+    return {
+        "source_url": pick("source_url"),
+        "venue_name": pick("venue_name"),
+        "performance_date": pick("performance_date"),
+        "org_name": pick("org_name"),
+        "salary_amount": pick("salary_amount"),
+    }
+
+
+# ============================================================
+# PART B: Optional AI metadata auto-detect (used in Step 2 later)
+# ============================================================
+
+_AUTODETECT_SYSTEM = (
+    "You extract structured metadata from USCIS O-1 evidence PDFs. "
+    "Return ONLY valid JSON. If a field is not found, return an empty string."
+)
+
+_AUTODETECT_USER = """Extract metadata from the following document text.
 
 Return JSON with keys:
 - source_url
@@ -42,6 +155,10 @@ DOCUMENT TEXT:
 
 
 def autodetect_metadata(document_text: str) -> Dict:
+    """
+    Optional AI step: extracts metadata candidates from document text.
+    You will wire this into app.py later via a button (Step 2).
+    """
     api_key = _get_secret("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
@@ -49,13 +166,13 @@ def autodetect_metadata(document_text: str) -> Dict:
     model = _get_secret("OPENAI_MODEL") or "gpt-4.1-mini"
     client = OpenAI(api_key=api_key)
 
-    prompt = USER.format(text=document_text[:20000])  # keep costs controlled
+    prompt = _AUTODETECT_USER.format(text=(document_text or "")[:20000])  # cost control
 
     try:
         resp = client.responses.create(
             model=model,
             input=[
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": _AUTODETECT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
@@ -65,12 +182,14 @@ def autodetect_metadata(document_text: str) -> Dict:
     except Exception:
         data = {}
 
-    # normalize
-    out = {
-        "source_url": str(data.get("source_url", "") or ""),
-        "venue_name": str(data.get("venue_name", "") or ""),
-        "performance_date": str(data.get("performance_date", "") or ""),
-        "org_name": str(data.get("org_name", "") or ""),
-        "salary_amount": str(data.get("salary_amount", "") or ""),
+    def s(key: str) -> str:
+        val = data.get(key, "")
+        return str(val or "").strip()
+
+    return {
+        "source_url": s("source_url"),
+        "venue_name": s("venue_name"),
+        "performance_date": s("performance_date"),
+        "org_name": s("org_name"),
+        "salary_amount": s("salary_amount"),
     }
-    return out
