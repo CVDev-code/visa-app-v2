@@ -1,200 +1,147 @@
 import io
-import zipfile
+import math
+import json
+import os
+from typing import Dict, List, Tuple, Optional
+import fitz  # PyMuPDF
+from openai import OpenAI
 
-import streamlit as st
-from dotenv import load_dotenv
+RED = (1, 0, 0)
+WHITE = (1, 1, 1)
 
-from src.pdf_text import (
-    extract_text_from_pdf_bytes,
-    extract_first_page_text_from_pdf_bytes,
-)
-from src.metadata import (
-    extract_first_page_signals,
-    make_csv_template,
-    parse_metadata_csv,
-    merge_metadata,
-)
-from src.openai_terms import suggest_ovisa_quotes
-from src.pdf_highlighter import annotate_pdf_bytes
-from src.prompts import CRITERIA
+# ============================================================
+# GEOMETRY & MARGIN-FIRST PLACEMENT ENGINE
+# ============================================================
 
-load_dotenv()
-st.set_page_config(page_title="O-1 PDF Highlighter", layout="wide")
+def _center(rect: fitz.Rect) -> fitz.Point:
+    return fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
 
-st.title("O-1 PDF Highlighter")
-st.caption(
-    "Upload PDFs → choose criteria → approve/reject quotes → export criterion-specific highlighted PDFs"
-)
+def _union_rect(rects: List[fitz.Rect]) -> fitz.Rect:
+    r = fitz.Rect(rects[0])
+    for x in rects[1:]: r |= x
+    return r
 
-# -------------------------
-# Case setup (sidebar)
-# -------------------------
-with st.sidebar:
-    st.header("Case setup")
-    beneficiary_name = st.text_input("Beneficiary full name", value="")
-    variants_raw = st.text_input("Name variants (comma-separated)", value="")
-    beneficiary_variants = [v.strip() for v in variants_raw.split(",") if v.strip()]
+def _get_closest_point(rect: fitz.Rect, target: fitz.Point) -> fitz.Point:
+    """Returns the point on the rectangle boundary closest to the target."""
+    x = max(rect.x0, min(target.x, rect.x1))
+    y = max(rect.y0, min(target.y, rect.y1))
+    return fitz.Point(x, y)
 
-    st.subheader("Manual metadata (optional)")
-    source_url_input = st.text_input(
-        "Source URL", value="", help="Global fallback if not detected in PDF"
-    )
-    venue_name_input = st.text_input(
-        "Venue / Organization", value="", help="Global fallback for criteria 2/4"
-    )
-    org_name_input = st.text_input("Org Name (Crit 6)", value="")
-    performance_date_input = st.text_input("Performance Date", value="")
-    salary_amount_input = st.text_input("Salary amount", value="")
+def _optimize_layout_for_margin(text: str, target_margin_width: float, fontname: str = "helv") -> Tuple[int, str, float, float]:
+    """Wraps text to fit narrow side margins using 10-12pt font."""
+    best_layout = (10, text, target_margin_width, 40.0)
+    min_height = float('inf')
 
-    st.subheader("Select O-1 criteria")
-    default_criteria = ["2_past", "2_future", "3", "4_past", "4_future"]
-    selected_criteria_ids: list[str] = []
-    for cid, desc in CRITERIA.items():
-        checked = st.checkbox(f"({cid}) {desc}", value=(cid in default_criteria))
-        if checked:
-            selected_criteria_ids.append(cid)
+    for fs in [12, 11, 10]:
+        words = text.split()
+        lines, cur = [], []
+        for w in words:
+            trial = " ".join(cur + [w])
+            if fitz.get_text_length(trial, fontname=fontname, fontsize=fs) <= target_margin_width:
+                cur.append(w)
+            else:
+                lines.append(" ".join(cur))
+                cur = [w]
+        lines.append(" ".join(cur))
+        
+        h = (len(lines) * fs * 1.2) + 10
+        w = max([fitz.get_text_length(l, fontname=fontname, fontsize=fs) for l in lines]) + 10
+        
+        if h < min_height:
+            min_height = h
+            best_layout = (fs, "\n".join(lines), w, h)
+    return best_layout
 
-uploaded_files = st.file_uploader(
-    "Upload one or more PDF files",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
-
-if not uploaded_files:
-    st.info("Upload at least one PDF to begin.")
-    st.stop()
-
-if not beneficiary_name.strip():
-    st.warning("Enter the beneficiary full name in the sidebar.")
-    st.stop()
-
-# -------------------------
-# Session state
-# -------------------------
-if "ai_by_file" not in st.session_state:
-    st.session_state["ai_by_file"] = {}
-if "approval" not in st.session_state:
-    st.session_state["approval"] = {}
-if "csv_metadata" not in st.session_state:
-    st.session_state["csv_metadata"] = None
-if "overrides_by_file" not in st.session_state:
-    st.session_state["overrides_by_file"] = {}
-if "meta_by_file" not in st.session_state:
-    st.session_state["meta_by_file"] = {}
-
-# -------------------------
-# Metadata Processing
-# -------------------------
-st.subheader("🧾 Metadata Management")
-
-global_defaults = {
-    "source_url": source_url_input.strip() or None,
-    "venue_name": venue_name_input.strip() or None,
-    "performance_date": performance_date_input.strip() or None,
-    "salary_amount": salary_amount_input.strip() or None,
-    "org_name": org_name_input.strip() or None,
-}
-
-# CSV Logic
-with st.expander("CSV metadata (bulk mode)", expanded=False):
-    filenames = [f.name for f in uploaded_files]
-    st.download_button("⬇️ Download CSV template", data=make_csv_template(filenames), file_name="o1_metadata.csv", mime="text/csv")
-    csv_file = st.file_uploader("Upload filled CSV", type=["csv"], key="csv_up")
-    if csv_file:
-        st.session_state["csv_metadata"] = parse_metadata_csv(csv_file.getvalue())
-
-# Resolve per-file metadata
-for f in uploaded_files:
-    first_page_text = extract_first_page_text_from_pdf_bytes(f.getvalue())
-    auto = extract_first_page_signals(first_page_text)
+def _choose_best_margin_spot(page: fitz.Page, targets: List[fitz.Rect], occupied: List[fitz.Rect], label: str) -> Tuple[fitz.Rect, str, int]:
+    """Prioritizes left/right margins to avoid central document text."""
+    pr = page.rect
+    target_union = _union_rect(targets)
+    target_y = (target_union.y0 + target_union.y1) / 2
     
-    overrides = st.session_state["overrides_by_file"].get(f.name, {})
-    resolved = merge_metadata(
-        filename=f.name,
-        auto=auto,
-        global_defaults=global_defaults,
-        csv_data=st.session_state["csv_metadata"],
-        overrides=overrides,
-    )
-    st.session_state["meta_by_file"][f.name] = resolved
+    margin_w = 85.0 # Narrow width for side placement
+    left_x = 25.0
+    right_x = pr.width - 25.0 - margin_w
 
-    with st.expander(f"Edit Metadata: {f.name}"):
-        o = dict(overrides)
-        o["venue_name"] = st.text_input("Venue Override", value=resolved.get("venue_name") or "", key=f"v_{f.name}")
-        st.session_state["overrides_by_file"][f.name] = {k: v for k, v in o.items() if v}
-        st.json(resolved)
+    text_blocks = [fitz.Rect(b[:4]) for b in page.get_text("blocks")]
+    candidates = []
 
-# -------------------------
-# Step 1: AI Analysis
-# -------------------------
-st.divider()
-if st.button("1️⃣ Generate Quotes (AI)", type="primary"):
-    with st.spinner("Analyzing PDFs..."):
-        for f in uploaded_files:
-            text = extract_text_from_pdf_bytes(f.getvalue())
-            data = suggest_ovisa_quotes(
-                document_text=text,
-                beneficiary_name=beneficiary_name,
-                beneficiary_variants=beneficiary_variants,
-                selected_criteria_ids=selected_criteria_ids
-            )
-            st.session_state["ai_by_file"][f.name] = data
-            st.session_state["approval"][f.name] = {
-                cid: {it["quote"]: True for it in data.get("by_criterion", {}).get(cid, [])}
-                for cid in selected_criteria_ids
-            }
-    st.success("Analysis complete.")
+    for x_start in [left_x, right_x]:
+        fs, txt, w, h = _optimize_layout_for_margin(label, margin_w)
+        cand = fitz.Rect(x_start, target_y - h/2, x_start + w, target_y + h/2)
+        
+        # Keep on page Y-bounds
+        if cand.y0 < 25: cand.y1 += (25 - cand.y0); cand.y0 = 25
+        if cand.y1 > pr.height - 25: cand.y0 -= (cand.y1 - (pr.height - 25)); cand.y1 = pr.height - 25
 
-# -------------------------
-# Step 2: Approval UI
-# -------------------------
-st.divider()
-st.subheader("2️⃣ Review & Approve")
-for f in uploaded_files:
-    if f.name not in st.session_state["ai_by_file"]: continue
-    st.markdown(f"### {f.name}")
-    by_criterion = st.session_state["ai_by_file"][f.name].get("by_criterion", {})
-    
-    for cid in selected_criteria_ids:
-        items = by_criterion.get(cid, [])
-        if not items: continue
-        with st.expander(f"Criterion {cid} - {CRITERIA[cid]}"):
-            for it in items:
-                q = it["quote"]
-                st.session_state["approval"][f.name][cid][q] = st.checkbox(
-                    f"[{it['strength']}] {q}", 
-                    value=st.session_state["approval"][f.name][cid].get(q, True),
-                    key=f"cb_{f.name}_{cid}_{q}"
-                )
+        # Score by vertical distance + heavy collision penalties
+        score = abs(target_y - _center(cand).y)
+        for occ in occupied:
+            if cand.intersects(occ): score += 50000 
+        for block in text_blocks:
+            if cand.intersects(block): score += 2000 # Strong preference for margin gaps
+            
+        candidates.append((score, cand, txt, fs))
 
-# -------------------------
-# Step 3: Export
-# -------------------------
-st.divider()
-st.subheader("3️⃣ Export")
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1], candidates[0][2], candidates[0][3]
 
-def build_annotated_pdf_bytes(pdf_bytes: bytes, quotes: list[str], criterion_id: str, filename: str):
-    # This now matches the 3-argument signature in your src/pdf_highlighter.py
-    # pdf_bytes, quote_terms, meta
-    meta = st.session_state["meta_by_file"].get(filename, {}).copy()
-    meta["beneficiary_name"] = beneficiary_name
-    
-    # Check if criterion_id is needed in your version of annotate_pdf_bytes
-    # If your src/pdf_highlighter.py was updated to accept it, use:
-    # return annotate_pdf_bytes(pdf_bytes, quotes, criterion_id=criterion_id, meta=meta)
-    # Based on the file content you provided for pdf_highlighter.py, it takes 3:
-    return annotate_pdf_bytes(pdf_bytes, quotes, meta=meta)
+# ============================================================
+# MAIN ANNOTATOR FUNCTION
+# ============================================================
 
-if st.button("Generate & Download ZIP"):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as zf:
-        for f in uploaded_files:
-            if f.name not in st.session_state["approval"]: continue
-            for cid in selected_criteria_ids:
-                approvals = st.session_state["approval"][f.name].get(cid, {})
-                approved = [q for q, ok in approvals.items() if ok]
-                if approved:
-                    out_bytes = build_annotated_pdf_bytes(f.getvalue(), approved, cid, f.name)
-                    zf.writestr(f"{f.name}_crit_{cid}.pdf", out_bytes)
-    
-    st.download_button("⬇️ Download ZIP", data=zip_buffer.getvalue(), file_name="o1_highlights.zip")
+def annotate_pdf_bytes(
+    pdf_bytes: bytes,
+    quote_terms: List[str],
+    criterion_id: str, # Fixes TypeError: parameter restored
+    meta: Dict,
+) -> Tuple[bytes, Dict]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if len(doc) == 0:
+        return pdf_bytes, {}
+
+    page1 = doc.load_page(0)
+    occupied_callouts: List[fitz.Rect] = []
+
+    # 1. Red box specific quotes throughout document
+    for pno in range(len(doc)):
+        page = doc.load_page(pno)
+        for term in (quote_terms or []):
+            if not term.strip(): continue
+            for r in page.search_for(term):
+                page.draw_rect(r, color=RED, width=1.5)
+
+    # 2. Metadata Labels (Prioritizing Margins)
+    meta_jobs = [
+        ("Original source of publication.", meta.get("source_url")),
+        ("The distinguished organization.", meta.get("venue_name") or meta.get("org_name")),
+        ("Performance date.", meta.get("performance_date")),
+        ("Beneficiary lead role evidence.", meta.get("beneficiary_name")),
+    ]
+
+    for label, val in meta_jobs:
+        if not val or not str(val).strip(): continue
+        
+        targets = page1.search_for(str(val))
+        if not targets: continue
+        
+        # Highlight target
+        for t in targets:
+            page1.draw_rect(t, color=RED, width=1.5)
+            
+        # Get placement in the margin
+        callout_rect, txt, fs = _choose_best_margin_spot(page1, targets, occupied_callouts, label)
+        
+        # Legibility Shield
+        page1.draw_rect(callout_rect, color=WHITE, fill=WHITE, overlay=True)
+        page1.insert_textbox(callout_rect, txt, fontname="helv", fontsize=fs, color=RED)
+        
+        # Draw connector from edge of box to target
+        start_p = _get_closest_point(callout_rect, _center(targets[0]))
+        page1.draw_line(start_p, _center(targets[0]), color=RED, width=1.0)
+        
+        occupied_callouts.append(callout_rect)
+
+    out = io.BytesIO()
+    doc.save(out)
+    doc.close()
+    return out.getvalue(), {"status": "success", "criterion": criterion_id}
