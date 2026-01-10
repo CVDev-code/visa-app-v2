@@ -41,6 +41,15 @@ _MAX_TERM = 600
 _CHUNK = 70
 _CHUNK_OVERLAP = 22
 
+# ============================================================
+# Ink-check knobs (NEW)
+# ============================================================
+# Render candidate areas and reject if there's visible "ink" underneath.
+INKCHECK_DPI = 90
+INKCHECK_NONWHITE_RATIO = 0.002  # 0.2% non-white pixels allowed (antialias tolerance)
+INKCHECK_WHITE_THRESHOLD = 250   # RGB channel >= this counts as "white"
+INKCHECK_PAD = 1.5               # test slightly inflated region
+
 
 # ============================================================
 # Geometry helpers
@@ -163,6 +172,44 @@ def _draw_straight_connector(
 
 
 # ============================================================
+# Ink check (NEW): reject callouts that cover any visible content
+# ============================================================
+
+def _rect_has_ink(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    *,
+    dpi: int = INKCHECK_DPI,
+    nonwhite_ratio: float = INKCHECK_NONWHITE_RATIO,
+    white_threshold: int = INKCHECK_WHITE_THRESHOLD,
+) -> bool:
+    """
+    Render the region and detect if it contains any visible content (text/lines/images/etc.).
+    Returns True if there is "ink" (non-white pixels) above tolerance.
+    """
+    r = fitz.Rect(rect) & page.rect
+    if r.is_empty or r.width < 2 or r.height < 2:
+        return True
+
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = page.get_pixmap(matrix=mat, clip=r, alpha=False)
+
+    s = pix.samples
+    if not s:
+        return True
+
+    total_px = pix.width * pix.height
+    nonwhite = 0
+
+    # pix.samples is RGB bytes (alpha=False)
+    for i in range(0, len(s), 3):
+        if s[i] < white_threshold or s[i + 1] < white_threshold or s[i + 2] < white_threshold:
+            nonwhite += 1
+
+    return (nonwhite / max(1, total_px)) > nonwhite_ratio
+
+
+# ============================================================
 # Blockers (areas we must not cover) + text envelope
 # ============================================================
 
@@ -174,6 +221,29 @@ def _page_text_blocks(page: fitz.Page) -> List[fitz.Rect]:
     except Exception:
         pass
     return blocks
+
+def _page_word_rects(page: fitz.Page) -> List[fitz.Rect]:
+    """
+    Word-level rectangles are often more reliable than blocks for avoiding overlap with text.
+    """
+    rects: List[fitz.Rect] = []
+    try:
+        words = page.get_text("words")  # x0,y0,x1,y1,"word",block,line,wordno
+        for w in words:
+            rects.append(fitz.Rect(w[:4]))
+    except Exception:
+        pass
+    return rects
+
+def _page_text_shapes(page: fitz.Page) -> List[fitz.Rect]:
+    """
+    Use BOTH blocks and words.
+    Words catch cases where blocks are missing/coarse.
+    """
+    rects: List[fitz.Rect] = []
+    rects.extend(_page_text_blocks(page))
+    rects.extend(_page_word_rects(page))
+    return rects
 
 def _page_images(page: fitz.Page) -> List[fitz.Rect]:
     imgs: List[fitz.Rect] = []
@@ -199,7 +269,7 @@ def _page_drawings(page: fitz.Page) -> List[fitz.Rect]:
 
 def _page_blockers(page: fitz.Page) -> List[fitz.Rect]:
     blockers: List[fitz.Rect] = []
-    for r in _page_text_blocks(page):
+    for r in _page_text_shapes(page):
         blockers.append(inflate_rect(r, GAP_FROM_TEXT_BLOCKS))
     for r in _page_images(page):
         blockers.append(inflate_rect(r, GAP_FROM_IMAGES))
@@ -262,7 +332,7 @@ def _optimize_layout(text: str, box_width: float) -> Tuple[int, str, float, floa
 # ============================================================
 # Placement zones (margins/top/bottom bands)
 # IMPORTANT: We do NOT allow placing inside blockers (hard constraint),
-# but we DO allow boxes inside the envelope bands as long as they don't overlap blockers.
+# and ALSO we do an ink-check to avoid covering any visible content.
 # ============================================================
 
 def _zones(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
@@ -298,7 +368,6 @@ def _zones(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
     if bottom.height > 30:
         zones.append(("bottom", bottom))
 
-    # If the envelope consumes almost the whole page, we still keep only top/bottom bands if possible.
     if zones:
         return zones
 
@@ -307,10 +376,6 @@ def _zones(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
 
 # ============================================================
 # Candidate generation + scoring
-# Key change vs your current approach:
-# - HARD constraint: callout MUST NOT intersect blockers or other callouts
-# - We generate lots of candidates in ALL zones, then pick the best.
-# - This prevents “defaults to top corners” stacking because we pack with occupied rectangles.
 # ============================================================
 
 def _box_width_for_zone(zone_name: str, zone_rect: fitz.Rect) -> float:
@@ -363,9 +428,9 @@ def _choose_best_spot(
 
     occupied_buf: List[fitz.Rect] = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied_callouts]
 
-    # Obstacles for connector scoring (we don't want the line crossing text blocks / other callouts / other highlight boxes)
+    # Obstacles for connector scoring (avoid crossing text/callouts/nearby highlights)
     connector_obstacles: List[fitz.Rect] = []
-    for b in _page_text_blocks(page):
+    for b in _page_text_shapes(page):
         connector_obstacles.append(inflate_rect(b, 1.5))
     for o in occupied_callouts:
         connector_obstacles.append(inflate_rect(o, 2.0))
@@ -374,7 +439,7 @@ def _choose_best_spot(
 
     zones = _zones(page)
 
-    # Candidate y offsets around the target y (so we can sit near the relevant text)
+    # Candidate y offsets around the target y (sit near relevant text)
     y_offsets = [-140, -110, -80, -55, -30, 0, 30, 55, 80, 110, 140]
 
     candidates: List[Tuple[float, fitz.Rect, str, int, bool]] = []
@@ -383,11 +448,11 @@ def _choose_best_spot(
         bw = _box_width_for_zone(zone_name, z)
         fs, wrapped, w, h = _optimize_layout(label, bw)
 
-        # choose x anchoring by zone type
         def make_rect_at(cy: float) -> Optional[fitz.Rect]:
             y0 = cy - h / 2
             y1 = cy + h / 2
 
+            # choose x anchoring by zone type
             if zone_name == "left":
                 x0 = z.x0
                 x1 = min(z.x1, x0 + w)
@@ -419,7 +484,8 @@ def _choose_best_spot(
             if not cand:
                 continue
 
-            # HARD constraints: never cover original content; never overlap other callouts; never overlap the highlight target area
+            # HARD constraints: never cover extracted text/images/drawings; never overlap other callouts;
+            # never overlap expanded highlight area
             if _intersects_any(cand, blockers):
                 continue
             if _intersects_any(cand, occupied_buf):
@@ -427,11 +493,15 @@ def _choose_best_spot(
             if _intersects_any(cand, highlight_blockers):
                 continue
 
-            # connector scoring (still only a single straight line)
+            # NEW HARD constraint: ink-check (catches text that extraction missed)
+            if _rect_has_ink(page, inflate_rect(cand, INKCHECK_PAD)):
+                continue
+
+            # connector scoring (single straight line)
             s, e, hits, length = _straight_connector_best_pair(cand, target_union, connector_obstacles)
 
-            # additional penalty if the straight segment crosses any text block (even if hits sampler misses)
-            for tb in _page_text_blocks(page):
+            # extra penalty if segment crosses any text shapes
+            for tb in _page_text_shapes(page):
                 if _segment_hits_rect(s, e, tb):
                     hits += 2
 
@@ -444,15 +514,15 @@ def _choose_best_spot(
 
             candidates.append((score, cand, wrapped, fs, True))
 
-    # If we found no valid (non-overlapping) candidates, we relax ONLY by not drawing white background,
-    # but we still refuse to cover blockers: so we generate a few “edge-only” candidates in top/bottom.
+    # Emergency mode: if no candidates, relax only the white background requirement.
+    # Still refuses to overlap callouts; and still uses ink-check to avoid covering content.
     if not candidates:
         for zone_name, z in zones:
             if zone_name not in ("top", "bottom", "full"):
                 continue
             bw = _box_width_for_zone(zone_name, z)
             fs, wrapped, w, h = _optimize_layout(label, bw)
-            # push to the very top/bottom inside that band
+
             if zone_name == "top":
                 cand = fitz.Rect(z.x0, z.y0, min(z.x1, z.x0 + w), min(z.y1, z.y0 + h))
             else:
@@ -461,11 +531,13 @@ def _choose_best_spot(
             cand = _clamp_rect_to_zone(cand, z)
             if not cand:
                 continue
-            # must not overlap other callouts; if it overlaps blockers, we still accept BUT without white bg
             if _intersects_any(cand, occupied_buf):
                 continue
 
-            # score by line length only (we’re in emergency mode)
+            # ink-check still applies in emergency mode
+            if _rect_has_ink(page, inflate_rect(cand, INKCHECK_PAD)):
+                continue
+
             s, e, hits, length = _straight_connector_best_pair(cand, target_union, connector_obstacles)
             score = (hits * 9000.0) + length + 2000.0
             candidates.append((score, cand, wrapped, fs, False))
@@ -642,12 +714,12 @@ def annotate_pdf_bytes(
             page1.draw_rect(t, color=RED, width=BOX_WIDTH)
         total_meta_hits += len(targets)
 
-        # Place callout: HARD no-overlap with page text/images
+        # Place callout: HARD no-overlap with any page content (blockers + ink-check)
         callout_rect, wrapped_text, fs, safe_for_white_bg = _choose_best_spot(
             page1, targets, occupied_callouts, label
         )
 
-        # White background ONLY when safe_for_white_bg (and will still not overlap blockers in normal mode)
+        # White background ONLY when safe_for_white_bg
         if safe_for_white_bg:
             page1.draw_rect(callout_rect, color=WHITE, fill=WHITE, overlay=True)
 
@@ -662,11 +734,11 @@ def annotate_pdf_bytes(
 
         # Obstacles for connector drawing:
         obstacles: List[fitz.Rect] = []
-        for b in _page_text_blocks(page1):
+        for b in _page_text_shapes(page1):
             obstacles.append(inflate_rect(b, 1.5))
         for o in occupied_callouts:
             obstacles.append(inflate_rect(o, 2.0))
-        # also treat all targets as obstacles (expanded) so we try not to cross adjacent highlight boxes
+        # treat all targets as obstacles (expanded) so we try not to cross adjacent highlight boxes
         expanded_targets = [inflate_rect(t, 2.5) for t in targets]
         obstacles.extend(expanded_targets)
 
@@ -718,7 +790,7 @@ def annotate_pdf_bytes(
             connect_policy="union",
         )
 
-    # Beneficiary name + variants — connect to ALL matches so you don’t get “only one line” when there are multiple boxes
+    # Beneficiary name + variants — connect to ALL matches
     bname = (meta.get("beneficiary_name") or "").strip()
     variants = meta.get("beneficiary_variants") or []
     needles = []
@@ -728,6 +800,7 @@ def annotate_pdf_bytes(
         vv = (v or "").strip()
         if vv:
             needles.append(vv)
+
     if needles:
         # de-dup
         seen = set()
