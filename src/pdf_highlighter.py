@@ -228,45 +228,45 @@ def _optimize_layout_for_margin(text: str, box_width: float) -> Tuple[int, str, 
 # ============================================================
 
 def _allowed_zones(page: fitz.Page) -> List[fitz.Rect]:
-    """
-    Returns placement zones that are strictly:
-    - Left margin band (left of text envelope)
-    - Right margin band (right of text envelope)
-    - Top band (above text envelope)
-    - Bottom band (below text envelope)
-    If no text envelope, whole page is allowed (minus edge pads).
-    """
     pr = page.rect
     env = _text_envelope(page)
 
-    # default: whole page inset
+    # If we somehow can't detect text, allow the full inset page
     if env is None or env.get_area() <= 0:
         return [fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)]
 
-    # Expand the envelope slightly so we don't sit between lines / close to text
+    # Expand envelope so we never sit "between lines"
     env2 = inflate_rect(env, GAP_FROM_TEXT_BLOCKS)
 
     zones: List[fitz.Rect] = []
 
-    # left margin: x < env2.x0
-    if env2.x0 - EDGE_PAD > 60:
-        zones.append(fitz.Rect(EDGE_PAD, EDGE_PAD, env2.x0, pr.height - EDGE_PAD))
+    # Left margin band
+    left = fitz.Rect(EDGE_PAD, EDGE_PAD, env2.x0, pr.height - EDGE_PAD)
+    if left.width > 40:  # allow narrow bands; wrapping will handle it
+        zones.append(left)
 
-    # right margin: x > env2.x1
-    if (pr.width - EDGE_PAD) - env2.x1 > 60:
-        zones.append(fitz.Rect(env2.x1, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD))
+    # Right margin band
+    right = fitz.Rect(env2.x1, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
+    if right.width > 40:
+        zones.append(right)
 
-    # top band: y < env2.y0
-    if env2.y0 - EDGE_PAD > 40:
-        zones.append(fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, env2.y0))
+    # Top band
+    top = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, env2.y0)
+    if top.height > 30:
+        zones.append(top)
 
-    # bottom band: y > env2.y1
-    if (pr.height - EDGE_PAD) - env2.y1 > 40:
-        zones.append(fitz.Rect(EDGE_PAD, env2.y1, pr.width - EDGE_PAD, pr.height - EDGE_PAD))
+    # Bottom band
+    bottom = fitz.Rect(EDGE_PAD, env2.y1, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
+    if bottom.height > 30:
+        zones.append(bottom)
 
-    # If everything is too tight, fall back to margins-only based on page edge
-    if not zones:
-        zones = [fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)]
+    # CRITICAL: never fall back to whole page.
+    # If margin bands are unusable, we only allow top/bottom.
+    if zones:
+        return zones
+
+    # If absolutely nothing is available (rare), return a thin top strip (still outside text)
+    return [fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, min(env2.y0, EDGE_PAD + 60))]
 
     return zones
 
