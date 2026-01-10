@@ -42,7 +42,6 @@ def extract_first_page_signals(first_page_text: str) -> Dict:
 
     return {
         "source_url": url or None,
-        # Keep these blank unless you add better regexes later
         "venue_name": None,
         "performance_date": None,
         "salary_amount": None,
@@ -53,7 +52,6 @@ def extract_first_page_signals(first_page_text: str) -> Dict:
 def make_csv_template(filenames: list[str]) -> bytes:
     """
     Produces a CSV template for bulk metadata entry.
-    Columns are intentionally simple.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -125,7 +123,7 @@ def merge_metadata(
 
 
 # ============================================================
-# PART B: Optional AI metadata auto-detect (used in Step 2 later)
+# PART B: AI metadata auto-detect (Fixed for OpenAI v1.0+)
 # ============================================================
 
 _AUTODETECT_SYSTEM = (
@@ -157,29 +155,34 @@ DOCUMENT TEXT:
 def autodetect_metadata(document_text: str) -> Dict:
     """
     Optional AI step: extracts metadata candidates from document text.
-    You will wire this into app.py later via a button (Step 2).
     """
     api_key = _get_secret("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    model = _get_secret("OPENAI_MODEL") or "gpt-4.1-mini"
+    # Corrected model name: gpt-4o-mini
+    model = _get_secret("OPENAI_MODEL") or "gpt-4o-mini"
     client = OpenAI(api_key=api_key)
 
-    prompt = _AUTODETECT_USER.format(text=(document_text or "")[:20000])  # cost control
+    prompt = _AUTODETECT_USER.format(text=(document_text or "")[:20000])
 
     try:
-        resp = client.responses.create(
+        # Standard Chat Completion API call
+        resp = client.chat.completions.create(
             model=model,
-            input=[
+            messages=[
                 {"role": "system", "content": _AUTODETECT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
         )
-        raw = getattr(resp, "output_text", "") or ""
+        
+        # Corrected way to access the response content
+        raw = resp.choices[0].message.content
         data = json.loads(raw) if raw else {}
-    except Exception:
+    except Exception as e:
+        # Print the error to Streamlit logs for debugging
+        print(f"Metadata Extraction Error: {e}")
         data = {}
 
     def s(key: str) -> str:
