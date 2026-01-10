@@ -15,7 +15,7 @@ from src.metadata import (
     merge_metadata,
 )
 from src.openai_terms import suggest_ovisa_quotes
-from src.pdf_highlighter import highlight_terms_in_pdf_bytes
+from src.pdf_highlighter import annotate_pdf_bytes
 from src.prompts import CRITERIA
 
 load_dotenv()
@@ -32,9 +32,15 @@ with st.sidebar:
     beneficiary_name = st.text_input("Beneficiary full name", value="")
     variants_raw = st.text_input("Name variants (comma-separated)", value="")
     beneficiary_variants = [v.strip() for v in variants_raw.split(",") if v.strip()]
+    st.subheader("Manual metadata (optional but improves outputs)")
+    source_url = st.text_input("Source URL (exact text as shown in PDF page 1)", value="")
+    venue_name = st.text_input("Venue / organisation name (for criteria 2/4)", value="")
+    org_name = st.text_input("Organisation name (for criterion 6)", value="")
+    performance_date = st.text_input("Performance date (exact text as shown in PDF)", value="")
+    salary_amount = st.text_input("Salary amount (for criterion 7) – e.g. $10,000", value="")
 
     st.subheader("Select O-1 criteria to extract")
-    default_criteria = ["2", "3", "4"]  # sensible defaults for musicians
+    default_criteria = ["2_past", "2_future", "3", "4_past", "4_future"] # sensible defaults for musicians
     selected_criteria_ids = []
     for cid, desc in CRITERIA.items():
         checked = st.checkbox(f"({cid}) {desc}", value=(cid in default_criteria))
@@ -296,7 +302,7 @@ for f in uploaded_files:
         crit_desc = CRITERIA.get(cid, "")
         items = by_criterion.get(cid, [])
 
-        with st.expander(f"{crit_title}: {crit_desc}", expanded=(cid in {"2", "3", "4"})):
+        with st.expander(f"{crit_title}: {crit_desc}", expanded=(cid.startswith(("2", "4")) or cid == "3"):
             if not items:
                 st.write("No candidates found for this criterion in this document.")
                 continue
@@ -336,9 +342,22 @@ st.divider()
 st.subheader("3️⃣ Export highlighted PDFs by criterion")
 
 
-def build_highlighted_pdf_bytes(pdf_bytes: bytes, quotes: list[str]):
-    # reuses your red-box highlighter; report contains total hits
-    return highlight_terms_in_pdf_bytes(pdf_bytes, quotes)
+def build_annotated_pdf_bytes(pdf_bytes: bytes, quotes: list[str], criterion_id: str, filename: str):
+    # Use resolved per-file metadata from Mode B, but also include beneficiary info
+    resolved = st.session_state["meta_by_file"].get(filename, {}) or {}
+
+    meta = {
+        "source_url": resolved.get("source_url") or source_url,
+        "venue_name": resolved.get("venue_name") or venue_name,
+        "org_name": resolved.get("org_name") or org_name,
+        "performance_date": resolved.get("performance_date") or performance_date,
+        "salary_amount": resolved.get("salary_amount") or salary_amount,
+
+        "beneficiary_name": beneficiary_name,
+        "beneficiary_variants": beneficiary_variants,
+    }
+
+    return annotate_pdf_bytes(pdf_bytes, quotes, criterion_id=criterion_id, meta=meta)
 
 
 zip_btn = st.button("Export ALL selected criteria as ZIP (all PDFs)", type="primary")
@@ -356,7 +375,7 @@ if zip_btn:
                 approved_quotes = [q for q, ok in approvals.items() if ok]
                 if not approved_quotes:
                     continue
-                out_bytes, report = build_highlighted_pdf_bytes(f.getvalue(), approved_quotes)
+                out_bytes, report = build_annotated_pdf_bytes(f.getvalue(), approved_quotes, cid, filename=f.name)
                 out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
                 zf.writestr(out_name, out_bytes)
     zip_buffer.seek(0)
@@ -383,19 +402,29 @@ for f in uploaded_files:
         approved_quotes = [q for q, ok in approvals.items() if ok]
         if not approved_quotes:
             continue
-
+        
         if st.button(f"Generate PDF for Criterion {cid}", key=f"gen_{f.name}_{cid}"):
             with st.spinner("Annotating…"):
-                out_bytes, report = build_highlighted_pdf_bytes(f.getvalue(), approved_quotes)
-            out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
-            st.success(f"Created {out_name} — {report.get('total_hits', 0)} highlights found")
-            st.download_button(
-                f"⬇️ Download {out_name}",
-                data=out_bytes,
-                file_name=out_name,
-                mime="application/pdf",
-                key=f"dl_{f.name}_{cid}",
-            )
+        out_bytes, report = build_annotated_pdf_bytes(
+            f.getvalue(),
+            approved_quotes,
+            cid,
+            filename=f.name,
+        )
+
+    out_name = f.name.replace(".pdf", f"_criterion-{cid}_highlighted.pdf")
+
+    st.success(
+        f"Created {out_name} — quotes: {report.get('total_quote_hits', 0)} | meta: {report.get('total_meta_hits', 0)}"
+    )
+
+    st.download_button(
+        f"⬇️ Download {out_name}",
+        data=out_bytes,
+        file_name=out_name,
+        mime="application/pdf",
+        key=f"dl_{f.name}_{cid}",
+    )
 
 st.divider()
 st.caption("O-1 PDF Highlighter • Criterion-based extraction + approval workflow + per-criterion exports")
