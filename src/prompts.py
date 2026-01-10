@@ -1,11 +1,13 @@
 CRITERIA = {
-    "1": "Awards/prizes (significant national or international awards or prizes).",
-    "2": "Lead/starring participant in productions or events with distinguished reputation.",
-    "3": "National/international recognition via critical reviews or major published materials.",
-    "4": "Lead/starring/critical role for organizations/establishments with distinguished reputation.",
+    "1": "Significant national or international awards or prizes in the particular field.",
+    "2_past": "Lead or starring participant in PAST productions/events with a distinguished reputation.",
+    "2_future": "Lead or starring participant in FUTURE productions/events with a distinguished reputation.",
+    "3": "National or international recognition evidenced by critical reviews or other published materials.",
+    "4_past": "Lead/starring/critical role for PAST distinguished organizations/establishments.",
+    "4_future": "Lead/starring/critical role for FUTURE distinguished organizations/establishments.",
     "5": "Record of major commercial or critically acclaimed successes.",
-    "6": "Significant recognition from experts/organizations/critics (testimonials).",
-    "7": "High salary or substantial remuneration (contracts or reliable evidence).",
+    "6": "Significant recognition for achievements from organizations/critics/experts.",
+    "7": "High salary or other substantial remuneration evidenced by contracts or reliable evidence.",
 }
 
 SYSTEM_PROMPT = """You are an expert US immigration paralegal specializing in USCIS O-1 (arts) petitions.
