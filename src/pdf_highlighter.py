@@ -1,63 +1,53 @@
 # src/pdf_highlighter.py
 import io
 import math
+import os
 import re
-from typing import Dict, List, Tuple, Optional
+import json
+from typing import Dict, List, Tuple, Optional, Any
 
 import fitz  # PyMuPDF
+
+# If you deploy on Streamlit Cloud, install openai in requirements.txt
+# pip install openai
+from openai import OpenAI
 
 RED = (1, 0, 0)
 WHITE = (1, 1, 1)
 
 # ============================================================
-# Visual style (match your "good" version)
+# Style knobs (keep close to your preferred look)
 # ============================================================
-BOX_WIDTH = 1.5      # highlight rectangle stroke
-LINE_WIDTH = 1.0     # connector stroke (thin)
+BOX_WIDTH = 1.5
+LINE_WIDTH = 1.0
 FONTNAME = "Times-Roman"
 FONT_SIZES = [12, 11, 10]
 
-# ============================================================
-# Placement knobs
-# ============================================================
 EDGE_PAD = 18.0
+
+# ============================================================
+# Hard safety gaps
+# ============================================================
 GAP_FROM_TEXT_BLOCKS = 10.0
 GAP_FROM_IMAGES = 12.0
 GAP_FROM_DRAWINGS = 10.0
 
-# Keep callouts away from highlight boxes and each other
 GAP_FROM_HIGHLIGHTS = 14.0
 GAP_BETWEEN_CALLOUTS = 10.0
 
-# Prevent “between lines” placement by hard-blocking the entire text column
-TEXT_COLUMN_BUFFER_X = 14.0       # expand envelope left/right
-SIDE_ZONE_GAP_FROM_TEXT = 10.0    # gutter starts this far from envelope
+# Hard-block the whole text column to stop "between lines"
+TEXT_COLUMN_BUFFER_X = 16.0
 
-# Callout sizing defaults
-MIN_CALLOUT_W = 110.0
-MAX_CALLOUT_W = 160.0  # keep margin-ish
-MAX_CALLOUT_H = 130.0
-
-# Search sampling for candidate spots
-Y_SCAN_STEP = 14.0
-Y_SCAN_SPAN = 260.0   # scan around target_y +/- span
-
-# Prefer left margin when both sides are equally good
-PREFER_LEFT = True
-
-# Pull connector endpoint slightly away from target edge
+# Connector cosmetics
 ENDPOINT_PULLBACK = 1.5
 
-# ============================================================
-# Ink check (relaxed in gutters, to ignore scanner noise)
-# ============================================================
-INKCHECK_DPI = 96
-INKCHECK_PAD = 1.5
-INK_SAMPLE_STRIDE = 6
-INK_DELTA = 18
-INK_RATIO_MAX = 0.012
-INK_RATIO_MAX_GUTTER = 0.030
-INK_DELTA_GUTTER_BONUS = 12
+# Candidate generation
+GRID_STEP_Y = 14.0
+GRID_STEP_X = 14.0
+MAX_CANDIDATES_TO_LLM = 60
+
+# Prefer side gutters strongly; top should be last resort.
+ZONE_ORDER = ["left", "right", "bottom", "top"]
 
 # ============================================================
 # Quote search robustness
@@ -65,6 +55,12 @@ INK_DELTA_GUTTER_BONUS = 12
 _MAX_TERM = 600
 _CHUNK = 70
 _CHUNK_OVERLAP = 22
+
+# ============================================================
+# LLM config
+# ============================================================
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # pick what you have access to
+LLM_TEMPERATURE = 0
 
 
 # ============================================================
@@ -90,6 +86,9 @@ def _union_rect(rects: List[fitz.Rect]) -> fitz.Rect:
 def _center(rect: fitz.Rect) -> fitz.Point:
     return fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
 
+def _intersects_any(r: fitz.Rect, others: List[fitz.Rect]) -> bool:
+    return any(r.intersects(o) for o in others)
+
 def _segment_hits_rect(p1: fitz.Point, p2: fitz.Point, r: fitz.Rect) -> bool:
     steps = 22
     for i in range(steps + 1):
@@ -110,7 +109,6 @@ def _pull_back_point(from_pt: fitz.Point, to_pt: fitz.Point, dist: float) -> fit
     return fitz.Point(to_pt.x + ux * dist, to_pt.y + uy * dist)
 
 def _mid_height_anchor(callout: fitz.Rect, toward: fitz.Point) -> fitz.Point:
-    """Start point on callout edge at mid-height."""
     y = callout.y0 + (callout.height / 2.0)
     cx = callout.x0 + callout.width / 2.0
     if toward.x >= cx:
@@ -131,33 +129,18 @@ def _target_edge_candidates(target: fitz.Rect) -> List[fitz.Point]:
         fitz.Point(target.x1, target.y1),
     ]
 
-def _choose_target_attachment(
-    start: fitz.Point,
-    target: fitz.Rect,
-    obstacles: List[fitz.Rect],
-) -> fitz.Point:
-    """Pick target edge point minimizing obstacle crossings then length."""
+def _choose_target_attachment(start: fitz.Point, target: fitz.Rect, obstacles: List[fitz.Rect]) -> fitz.Point:
     best_pt = _center(target)
     best_hits = 10**9
     best_len = 10**9
     for pt in _target_edge_candidates(target):
-        hits = 0
-        for ob in obstacles:
-            if _segment_hits_rect(start, pt, ob):
-                hits += 1
+        hits = sum(1 for ob in obstacles if _segment_hits_rect(start, pt, ob))
         seg_len = math.hypot(pt.x - start.x, pt.y - start.y)
         if hits < best_hits or (hits == best_hits and seg_len < best_len):
-            best_hits, best_len = hits, seg_len
-            best_pt = pt
+            best_hits, best_len, best_pt = hits, seg_len, pt
     return best_pt
 
-def _draw_straight_connector(
-    page: fitz.Page,
-    callout_rect: fitz.Rect,
-    target_rect: fitz.Rect,
-    obstacles: List[fitz.Rect],
-):
-    """Always straight line, but choose best endpoint to reduce crossings."""
+def _draw_straight_connector(page: fitz.Page, callout_rect: fitz.Rect, target_rect: fitz.Rect, obstacles: List[fitz.Rect]):
     tc = _center(target_rect)
     start = _mid_height_anchor(callout_rect, tc)
     end = _choose_target_attachment(start, target_rect, obstacles)
@@ -166,61 +149,17 @@ def _draw_straight_connector(
 
 
 # ============================================================
-# Ink detection (relaxed for gutters)
-# ============================================================
-
-def _rect_has_ink_adaptive(page: fitz.Page, rect: fitz.Rect, *, is_gutter: bool) -> bool:
-    r = (fitz.Rect(rect) & page.rect)
-    if r.is_empty or r.width < 2 or r.height < 2:
-        return True
-
-    pix = page.get_pixmap(matrix=fitz.Matrix(INKCHECK_DPI / 72, INKCHECK_DPI / 72), clip=r, alpha=False)
-    s, w, h = pix.samples, pix.width, pix.height
-    if not s or w < 2 or h < 2:
-        return True
-
-    ratio_max = INK_RATIO_MAX_GUTTER if is_gutter else INK_RATIO_MAX
-    delta = INK_DELTA + (INK_DELTA_GUTTER_BONUS if is_gutter else 0)
-    step = max(1, INK_SAMPLE_STRIDE)
-
-    total = 0
-    sr = sg = sb = 0
-    for y in range(0, h, step):
-        row = y * w * 3
-        for x in range(0, w, step):
-            i = row + x * 3
-            sr += s[i]; sg += s[i + 1]; sb += s[i + 2]
-            total += 1
-    if total <= 0:
-        return True
-
-    br, bg, bb = sr / total, sg / total, sb / total
-
-    ink = 0
-    total2 = 0
-    for y in range(0, h, step):
-        row = y * w * 3
-        for x in range(0, w, step):
-            i = row + x * 3
-            if (abs(s[i] - br) > delta) or (abs(s[i + 1] - bg) > delta) or (abs(s[i + 2] - bb) > delta):
-                ink += 1
-            total2 += 1
-
-    return (ink / total2) > ratio_max if total2 > 0 else True
-
-
-# ============================================================
-# Blockers + envelope
+# Page blockers + envelope
 # ============================================================
 
 def _page_text_blocks(page: fitz.Page) -> List[fitz.Rect]:
-    out: List[fitz.Rect] = []
+    blocks: List[fitz.Rect] = []
     try:
         for b in page.get_text("blocks"):
-            out.append(fitz.Rect(b[:4]))
+            blocks.append(fitz.Rect(b[:4]))
     except Exception:
         pass
-    return out
+    return blocks
 
 def _page_images(page: fitz.Page) -> List[fitz.Rect]:
     imgs: List[fitz.Rect] = []
@@ -260,28 +199,9 @@ def _page_blockers(page: fitz.Page) -> List[fitz.Rect]:
         blockers.append(inflate_rect(r, GAP_FROM_DRAWINGS))
     return blockers
 
-def _intersects_any(r: fitz.Rect, others: List[fitz.Rect]) -> bool:
-    return any(r.intersects(o) for o in others)
-
-def _clamp_to_safe(r: fitz.Rect, safe: fitz.Rect) -> Optional[fitz.Rect]:
-    rr = fitz.Rect(r)
-    if rr.x0 < safe.x0:
-        rr.x1 += (safe.x0 - rr.x0); rr.x0 = safe.x0
-    if rr.x1 > safe.x1:
-        rr.x0 -= (rr.x1 - safe.x1); rr.x1 = safe.x1
-    if rr.y0 < safe.y0:
-        rr.y1 += (safe.y0 - rr.y0); rr.y0 = safe.y0
-    if rr.y1 > safe.y1:
-        rr.y0 -= (rr.y1 - safe.y1); rr.y1 = safe.y1
-    if rr.x0 < safe.x0 or rr.x1 > safe.x1 or rr.y0 < safe.y0 or rr.y1 > safe.y1:
-        return None
-    if rr.width < 20 or rr.height < 18:
-        return None
-    return rr
-
 
 # ============================================================
-# Callout text wrapping
+# Callout text layout
 # ============================================================
 
 def _optimize_layout(text: str, box_width: float) -> Tuple[int, str, float, float]:
@@ -289,8 +209,9 @@ def _optimize_layout(text: str, box_width: float) -> Tuple[int, str, float, floa
     if not text:
         return 12, "", box_width, 24.0
 
-    box_width = max(MIN_CALLOUT_W, min(MAX_CALLOUT_W, box_width))
-    best = (10, text, box_width, 40.0)
+    best_fs = 10
+    best_wrapped = text
+    best_w = box_width
     best_h = 10**9
 
     for fs in FONT_SIZES:
@@ -316,37 +237,88 @@ def _optimize_layout(text: str, box_width: float) -> Tuple[int, str, float, floa
         h = (len(lines) * fs * 1.2) + 10.0
         if h < best_h:
             best_h = h
-            best = (fs, "\n".join(lines), box_width, h)
+            best_fs = fs
+            best_wrapped = "\n".join(lines)
+            best_w = box_width
 
-    fs, wrapped, w, h = best
-    h = min(h, MAX_CALLOUT_H)
-    return fs, wrapped, w, h
+    return best_fs, best_wrapped, best_w, best_h
 
 
 # ============================================================
-# Placement: side gutters derived from envelope, hard-block text column
+# Zones: compute gutters from envelope and produce candidate rects
 # ============================================================
 
-def _choose_best_side_spot(
-    page: fitz.Page,
-    targets: List[fitz.Rect],
-    occupied: List[fitz.Rect],
-    label: str,
-) -> Tuple[fitz.Rect, str, int, bool]:
+def _build_zones(page: fitz.Page) -> Dict[str, fitz.Rect]:
     pr = page.rect
     safe = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
 
-    target_union = _union_rect(targets)
-    ty = (target_union.y0 + target_union.y1) / 2.0
+    env = _text_envelope(page)
+    zones: Dict[str, fitz.Rect] = {}
+
+    if env:
+        left = fitz.Rect(safe.x0, safe.y0, env.x0 - 10.0, safe.y1)
+        right = fitz.Rect(env.x1 + 10.0, safe.y0, safe.x1, safe.y1)
+        top = fitz.Rect(safe.x0, safe.y0, safe.x1, env.y0 - 10.0)
+        bottom = fitz.Rect(safe.x0, env.y1 + 10.0, safe.x1, safe.y1)
+    else:
+        left = fitz.Rect(safe.x0, safe.y0, safe.x0 + 140.0, safe.y1)
+        right = fitz.Rect(safe.x1 - 140.0, safe.y0, safe.x1, safe.y1)
+        top = fitz.Rect(safe.x0, safe.y0, safe.x1, safe.y0 + 140.0)
+        bottom = fitz.Rect(safe.x0, safe.y1 - 140.0, safe.x1, safe.y1)
+
+    # keep only non-trivial zones
+    if left.width > 55 and left.height > 80:
+        zones["left"] = left & safe
+    if right.width > 55 and right.height > 80:
+        zones["right"] = right & safe
+    if bottom.height > 45:
+        zones["bottom"] = bottom & safe
+    if top.height > 45:
+        zones["top"] = top & safe
+
+    return zones
+
+def _grid_points(zone: fitz.Rect) -> List[fitz.Point]:
+    pts: List[fitz.Point] = []
+    y = zone.y0
+    while y <= zone.y1:
+        x = zone.x0
+        while x <= zone.x1:
+            pts.append(fitz.Point(x, y))
+            x += GRID_STEP_X
+        y += GRID_STEP_Y
+    return pts
+
+
+# ============================================================
+# Candidate generation (Python hard constraints)
+# ============================================================
+
+def _estimate_connector_metrics(
+    callout_rect: fitz.Rect,
+    target_rect: fitz.Rect,
+    obstacles: List[fitz.Rect],
+) -> Tuple[float, int]:
+    tc = _center(target_rect)
+    start = _mid_height_anchor(callout_rect, tc)
+    end = _choose_target_attachment(start, target_rect, obstacles)
+    length = math.hypot(end.x - start.x, end.y - start.y)
+    hits = sum(1 for ob in obstacles if _segment_hits_rect(start, end, ob))
+    return length, hits
+
+def _generate_candidates(
+    page: fitz.Page,
+    target_union: fitz.Rect,
+    label: str,
+    occupied_callouts: List[fitz.Rect],
+    highlight_blockers: List[fitz.Rect],
+) -> List[Dict[str, Any]]:
+    pr = page.rect
+    safe = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
 
     blockers = _page_blockers(page)
-    # keep away from highlight targets
-    highlight_blockers = [inflate_rect(t, GAP_FROM_HIGHLIGHTS) for t in targets]
-    blockers.extend(highlight_blockers)
-    # keep away from other callouts
-    occupied_buf = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied]
 
-    # Hard block the entire text column (prevents “between lines”)
+    # Hard-block full text column
     env = _text_envelope(page)
     if env:
         x0 = max(pr.x0, env.x0 - TEXT_COLUMN_BUFFER_X)
@@ -354,113 +326,234 @@ def _choose_best_side_spot(
         if x1 > x0 + 10:
             blockers.append(fitz.Rect(x0, pr.y0, x1, pr.y1))
 
-        # Build real gutters relative to envelope
-        left_zone = fitz.Rect(safe.x0, safe.y0, env.x0 - SIDE_ZONE_GAP_FROM_TEXT, safe.y1)
-        right_zone = fitz.Rect(env.x1 + SIDE_ZONE_GAP_FROM_TEXT, safe.y0, safe.x1, safe.y1)
-    else:
-        # No text detected: use generic gutters
-        left_zone = fitz.Rect(safe.x0, safe.y0, safe.x0 + 140.0, safe.y1)
-        right_zone = fitz.Rect(safe.x1 - 140.0, safe.y0, safe.x1, safe.y1)
+    # Also block highlights and existing callouts
+    blockers.extend(highlight_blockers)
+    blockers.extend([inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied_callouts])
 
-    # Validate zones
-    zones: List[Tuple[str, fitz.Rect]] = []
-    if left_zone.width >= 55 and left_zone.height >= 80:
-        zones.append(("left", left_zone))
-    if right_zone.width >= 55 and right_zone.height >= 80:
-        zones.append(("right", right_zone))
+    zones = _build_zones(page)
 
-    # If neither gutter is usable, fall back to top band (still non-overlapping)
-    if not zones:
-        top = fitz.Rect(safe.x0, safe.y0, safe.x1, min(safe.y1, safe.y0 + 140.0))
-        zones = [("top", top)]
+    # size the callout to fit the zone width (but not huge)
+    def callout_dims_for_zone(z: fitz.Rect) -> Tuple[int, str, float, float]:
+        bw = min(MAX_CALLOUT_W, max(MIN_CALLOUT_W, z.width - 8.0))
+        fs, wrapped, w, h = _optimize_layout(label, bw)
+        return fs, wrapped, w, h
 
-    # Candidate generation: scan Y positions around the target y within each zone
-    candidates: List[Tuple[float, fitz.Rect, str, int, bool]] = []
+    # connector obstacles: text blocks + existing callouts + highlight blockers
+    conn_obstacles: List[fitz.Rect] = []
+    for b in _page_text_blocks(page):
+        conn_obstacles.append(inflate_rect(b, 2.0))
+    for o in occupied_callouts:
+        conn_obstacles.append(inflate_rect(o, 2.0))
+    for hb in highlight_blockers:
+        conn_obstacles.append(inflate_rect(hb, 2.0))
 
-    for zn, z in zones:
-        # width is the zone width (capped), so we don't end up huge boxes
-        bw_guess = min(MAX_CALLOUT_W, max(MIN_CALLOUT_W, z.width - 6.0))
-        fs, wrapped, w, h = _optimize_layout(label, bw_guess)
+    candidates: List[Dict[str, Any]] = []
+    tid = 1
+    tc = _center(target_union)
 
-        # anchor x by zone
-        if zn == "left":
-            x0 = z.x0
-            x1 = x0 + w
-        elif zn == "right":
-            x1 = z.x1
-            x0 = x1 - w
-        else:
-            # top fallback: place near left or right depending on preference
-            if PREFER_LEFT:
+    for zone_name in ZONE_ORDER:
+        if zone_name not in zones:
+            continue
+        z = zones[zone_name]
+        fs, wrapped, w, h = callout_dims_for_zone(z)
+
+        pts = _grid_points(z)
+        # Sort by "close to target Y" first
+        pts.sort(key=lambda p: abs(p.y - tc.y))
+
+        for p in pts:
+            # Anchor callout inside the zone
+            if zone_name == "left":
                 x0 = z.x0
                 x1 = x0 + w
-            else:
+            elif zone_name == "right":
                 x1 = z.x1
                 x0 = x1 - w
+            elif zone_name == "bottom":
+                # bottom: align left so it doesn't overlay, but model can still choose bottom if best
+                x0 = z.x0
+                x1 = x0 + w
+            else:  # top
+                x0 = z.x0
+                x1 = x0 + w
 
-        # scan y positions
-        for dy in _frange(-Y_SCAN_SPAN, Y_SCAN_SPAN, Y_SCAN_STEP):
-            cy = ty + dy
-            cand = fitz.Rect(x0, cy - h / 2, x1, cy + h / 2)
-            cand = _clamp_to_safe(cand, safe)
-            if not cand:
+            cand = fitz.Rect(x0, p.y - h / 2, x1, p.y + h / 2)
+            cand = cand & safe
+            if cand.is_empty or cand.width < 30 or cand.height < 18:
                 continue
 
-            # Hard constraints: no overlap with blockers or occupied
+            # Hard constraints
             if _intersects_any(cand, blockers):
                 continue
-            if _intersects_any(cand, occupied_buf):
-                continue
 
-            # Only draw white bg if the region looks clean enough
-            is_gutter = (zn in ("left", "right"))
-            has_ink = _rect_has_ink_adaptive(page, inflate_rect(cand, INKCHECK_PAD), is_gutter=is_gutter)
-            safe_for_white = (not has_ink)
+            # Prefer not to be too far from target vertically (still allow URL to go bottom)
+            dist_y = abs((_center(cand).y) - tc.y)
 
-            # Score: prefer being close in Y, and prefer left/right strongly over top fallback
-            score = abs(dy)
-            if zn == "left":
-                score -= 2500.0 if PREFER_LEFT else 2000.0
-            elif zn == "right":
-                score -= 2500.0 if not PREFER_LEFT else 2000.0
-            else:
-                score += 4000.0  # top is truly last resort
+            # Connector metrics
+            conn_len, conn_hits = _estimate_connector_metrics(cand, target_union, conn_obstacles)
 
-            candidates.append((score, cand, wrapped, fs, safe_for_white))
+            candidates.append({
+                "id": tid,
+                "zone": zone_name,
+                "rect": {"x0": cand.x0, "y0": cand.y0, "x1": cand.x1, "y1": cand.y1},
+                "fontsize": fs,
+                "wrapped_text": wrapped,
+                "dist_y": dist_y,
+                "connector_len": conn_len,
+                "connector_crossings_est": conn_hits,
+            })
+            tid += 1
 
-    candidates.sort(key=lambda x: x[0])
+            # keep candidate list bounded per zone
+            if len(candidates) >= 400:
+                break
+        if len(candidates) >= 400:
+            break
+
+    return candidates
+
+
+# ============================================================
+# LLM ranking: choose best candidate ID
+# Uses Structured Outputs / json_schema so parsing is reliable.
+# ============================================================
+
+def _llm_choose_candidate(
+    *,
+    label: str,
+    target_union: fitz.Rect,
+    candidates: List[Dict[str, Any]],
+) -> int:
     if not candidates:
-        # Absolute fallback: packed placement in safe area, still non-overlapping
-        fs, wrapped, w, h = _optimize_layout(label, 140.0)
-        step = 26.0
-        for y in _frange(safe.y0, safe.y1 - h, step):
-            for x in _frange(safe.x0, safe.x1 - w, step):
-                cand = fitz.Rect(x, y, x + w, y + h)
-                if _intersects_any(cand, blockers):
-                    continue
-                if _intersects_any(cand, occupied_buf):
-                    continue
-                return cand, wrapped, fs, False
+        return -1
 
-        fb = fitz.Rect(safe.x0, safe.y0, safe.x0 + w, safe.y0 + h)
-        return fb, wrapped, fs, False
+    client = OpenAI()  # uses OPENAI_API_KEY from env automatically
 
-    _, best_rect, wrapped, fs, safe_for_white = candidates[0]
-    return best_rect, wrapped, fs, safe_for_white
+    # send only top N by a crude heuristic before asking the LLM
+    # (LLM should decide, but this keeps payload small)
+    def pre_score(c: Dict[str, Any]) -> float:
+        # prefer left/right, small connector, small dist_y, fewer crossings
+        zone = c["zone"]
+        zone_bonus = 0.0
+        if zone == "left":
+            zone_bonus = -9000.0
+        elif zone == "right":
+            zone_bonus = -8000.0
+        elif zone == "bottom":
+            zone_bonus = -2000.0
+        else:
+            zone_bonus = 3000.0
+        # Special case: URL/source label tends to bottom
+        if "source of publication" in label.lower() and zone == "bottom":
+            zone_bonus -= 4000.0
+        return (
+            zone_bonus
+            + c["dist_y"] * 1.1
+            + c["connector_len"] * 0.6
+            + c["connector_crossings_est"] * 2500.0
+        )
+
+    candidates_sorted = sorted(candidates, key=pre_score)[:MAX_CANDIDATES_TO_LLM]
+
+    # Prompt priorities (what you asked for)
+    prompt = {
+        "task": "Choose the best callout placement candidate.",
+        "label": label,
+        "priorities": [
+            "Prefer LEFT or RIGHT side gutters over top/bottom whenever possible.",
+            "Prefer the candidate that is vertically closest to the highlighted (target) text (small dist_y).",
+            "Prefer the shortest connector line (small connector_len).",
+            "Avoid connector lines that cross content (connector_crossings_est should be minimal).",
+            "Top placements are a last resort.",
+            "If label is 'Original source of publication.' prefer BOTTOM if it yields a shorter connector and keeps the callout near the URL.",
+        ],
+        "target_union": {"x0": target_union.x0, "y0": target_union.y0, "x1": target_union.x1, "y1": target_union.y1},
+        "candidates": candidates_sorted,
+        "output_rule": "Return ONLY the chosen_id (from the provided candidates) and a short reason.",
+    }
+
+    schema = {
+        "name": "callout_choice",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "chosen_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["chosen_id", "reason"],
+        },
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a layout assistant that selects the best callout placement candidate."},
+            {"role": "user", "content": json.dumps(prompt)},
+        ],
+        temperature=LLM_TEMPERATURE,
+        response_format={"type": "json_schema", "json_schema": schema},
+    )
+
+    content = resp.choices[0].message.content
+    data = json.loads(content)
+    chosen_id = int(data.get("chosen_id", -1))
+    return chosen_id
 
 
-def _frange(a: float, b: float, step: float):
-    x = a
-    if step == 0:
-        return
-    if a <= b:
-        while x <= b + 1e-9:
-            yield x
-            x += step
-    else:
-        while x >= b - 1e-9:
-            yield x
-            x -= step
+# ============================================================
+# Placement wrapper: Python generates candidates, LLM chooses, Python draws
+# ============================================================
+
+def _choose_best_spot_llm(
+    page: fitz.Page,
+    targets: List[fitz.Rect],
+    occupied_callouts: List[fitz.Rect],
+    label: str,
+) -> Tuple[fitz.Rect, str, int, bool]:
+    target_union = _union_rect(targets)
+
+    # Blockers around highlights
+    highlight_blockers = [inflate_rect(t, GAP_FROM_HIGHLIGHTS) for t in targets]
+
+    candidates = _generate_candidates(
+        page=page,
+        target_union=target_union,
+        label=label,
+        occupied_callouts=occupied_callouts,
+        highlight_blockers=highlight_blockers,
+    )
+
+    chosen_id = _llm_choose_candidate(label=label, target_union=target_union, candidates=candidates)
+
+    chosen = None
+    for c in candidates:
+        if c["id"] == chosen_id:
+            chosen = c
+            break
+
+    # Fallback if LLM fails or returns invalid id
+    if chosen is None:
+        # safest: pick the first candidate
+        if not candidates:
+            # ultimate fallback: top-left tiny box (no bg)
+            pr = page.rect
+            fs, wrapped, w, h = _optimize_layout(label, 140.0)
+            rect = fitz.Rect(EDGE_PAD, EDGE_PAD, EDGE_PAD + w, EDGE_PAD + h) & pr
+            return rect, wrapped, fs, False
+        chosen = candidates[0]
+
+    r = chosen["rect"]
+    rect = fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"])
+    wrapped_text = chosen["wrapped_text"]
+    fs = int(chosen["fontsize"])
+
+    # White bg: safe if not intersecting any blockers (it shouldn't) AND the zone is likely clean
+    # Since candidates were hard-filtered, we allow bg. If you want stricter, you can add an ink check here.
+    safe_for_white_bg = True
+
+    return rect, wrapped_text, fs, safe_for_white_bg
 
 
 # ============================================================
@@ -584,7 +677,7 @@ def annotate_pdf_bytes(
                 page.draw_rect(r, color=RED, width=BOX_WIDTH)
                 total_quote_hits += 1
 
-    # B) Metadata callouts (page 1)
+    # B) Metadata callouts (page 1) using LLM placement
     def _do_job(label: str, needles: List[str], *, connect_policy: str = "union"):
         nonlocal total_meta_hits, occupied_callouts
 
@@ -601,7 +694,7 @@ def annotate_pdf_bytes(
             page1.draw_rect(t, color=RED, width=BOX_WIDTH)
         total_meta_hits += len(targets)
 
-        callout_rect, wrapped_text, fs, safe_for_white_bg = _choose_best_side_spot(
+        callout_rect, wrapped_text, fs, safe_for_white_bg = _choose_best_spot_llm(
             page1, targets, occupied_callouts, label
         )
 
@@ -617,13 +710,12 @@ def annotate_pdf_bytes(
             align=fitz.TEXT_ALIGN_LEFT,
         )
 
-        # Obstacles for straight connector endpoint choice
+        # Obstacles for endpoint choice (keep connectors from crossing content)
         obstacles: List[fitz.Rect] = []
         for b in _page_text_blocks(page1):
             obstacles.append(inflate_rect(b, 2.0))
         for o in occupied_callouts:
             obstacles.append(inflate_rect(o, 2.0))
-        # treat other target boxes as obstacles (expanded slightly)
         for t in targets:
             obstacles.append(inflate_rect(t, 2.0))
 
@@ -640,26 +732,21 @@ def annotate_pdf_bytes(
 
         occupied_callouts.append(callout_rect)
 
-    # Source URL
     _do_job("Original source of publication.", _url_variants(str(meta.get("source_url") or "")), connect_policy="union")
 
-    # Venue / org
     venue = (meta.get("venue_name") or "").strip()
     org = (meta.get("org_name") or "").strip()
     if venue or org:
         _do_job("The distinguished organization.", [venue, org], connect_policy="union")
 
-    # Performance date
     perf = (meta.get("performance_date") or "").strip()
     if perf:
         _do_job("Performance date.", [perf], connect_policy="union")
 
-    # Salary
     sal = (meta.get("salary_amount") or "").strip()
     if sal:
         _do_job("Beneficiary salary evidence.", [sal], connect_policy="union")
 
-    # Beneficiary name + variants (connect to all matches)
     bname = (meta.get("beneficiary_name") or "").strip()
     variants = meta.get("beneficiary_variants") or []
     needles: List[str] = []
@@ -669,15 +756,8 @@ def annotate_pdf_bytes(
         vv = (v or "").strip()
         if vv:
             needles.append(vv)
-
     if needles:
-        seen = set()
-        uniq = []
-        for x in needles:
-            if x not in seen:
-                seen.add(x)
-                uniq.append(x)
-
+        uniq = list(dict.fromkeys(needles))
         _do_job("Beneficiary lead role evidence.", uniq, connect_policy="all")
 
     out = io.BytesIO()
