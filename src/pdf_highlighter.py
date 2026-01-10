@@ -20,10 +20,15 @@ FONT_SIZES = [12, 11, 10]
 
 EDGE_PAD = 18.0
 
-# Callouts MUST NOT overlap existing text/images/graphics (with padding)
+# Callouts MUST NOT overlap existing content (with padding)
 GAP_FROM_TEXT_BLOCKS = 14.0
 GAP_FROM_IMAGES = 12.0
 GAP_FROM_DRAWINGS = 10.0
+
+# NEW: extra vertical clearance around text lines
+# This is what prevents "between lines" placement.
+LINE_BLOCKER_PAD_X = 3.0
+LINE_BLOCKER_PAD_Y = 7.5  # increase if you still see between-line placement
 
 # Extra clearance away from red highlight boxes
 GAP_FROM_HIGHLIGHTS = 16.0
@@ -31,7 +36,7 @@ GAP_FROM_HIGHLIGHTS = 16.0
 # Keep callouts apart from each other
 GAP_BETWEEN_CALLOUTS = 12.0
 
-# Pull connector back a touch so it ends on the red box edge (not inside)
+# Pull connector back so it ends on the red box edge
 ENDPOINT_PULLBACK = 2.0
 
 # Quote search robustness
@@ -45,12 +50,19 @@ _CHUNK_OVERLAP = 22
 INKCHECK_DPI = 90
 INKCHECK_PAD = 1.5
 
-# Try strict -> relaxed -> more relaxed
-# (white_threshold, nonwhite_ratio)
+# Strict -> relaxed -> more relaxed
 INKCHECK_LEVELS = [
-    (250, 0.002),  # strict
-    (245, 0.006),  # relaxed
-    (235, 0.010),  # more relaxed
+    (250, 0.002),
+    (245, 0.006),
+    (235, 0.010),
+]
+
+# OPTIONAL: gutters often contain faint noise (page border / shading).
+# We allow a slightly more permissive final level *only for gutters*.
+INKCHECK_LEVELS_GUTTER = [
+    (250, 0.002),
+    (245, 0.008),
+    (235, 0.015),
 ]
 
 # ============================================================
@@ -69,6 +81,14 @@ def inflate_rect(r: fitz.Rect, pad: float) -> fitz.Rect:
     rr.y0 -= pad
     rr.x1 += pad
     rr.y1 += pad
+    return rr
+
+def inflate_rect_xy(r: fitz.Rect, padx: float, pady: float) -> fitz.Rect:
+    rr = fitz.Rect(r)
+    rr.x0 -= padx
+    rr.x1 += padx
+    rr.y0 -= pady
+    rr.y1 += pady
     return rr
 
 def _union_rect(rects: List[fitz.Rect]) -> fitz.Rect:
@@ -156,12 +176,7 @@ def _straight_connector_best_pair(
     best_e = _pull_back_point(best_s, best_e, ENDPOINT_PULLBACK)
     return best_s, best_e, best_hits, best_len
 
-def _draw_straight_connector(
-    page: fitz.Page,
-    callout_rect: fitz.Rect,
-    target_rect: fitz.Rect,
-    obstacles: List[fitz.Rect],
-):
+def _draw_straight_connector(page: fitz.Page, callout_rect: fitz.Rect, target_rect: fitz.Rect, obstacles: List[fitz.Rect]):
     s, e, _, _ = _straight_connector_best_pair(callout_rect, target_rect, obstacles)
     page.draw_line(s, e, color=RED, width=LINE_WIDTH)
 
@@ -170,14 +185,7 @@ def _draw_straight_connector(
 # Ink check (progressive)
 # ============================================================
 
-def _rect_has_ink(
-    page: fitz.Page,
-    rect: fitz.Rect,
-    *,
-    dpi: int,
-    white_threshold: int,
-    nonwhite_ratio: float,
-) -> bool:
+def _rect_has_ink(page: fitz.Page, rect: fitz.Rect, *, dpi: int, white_threshold: int, nonwhite_ratio: float) -> bool:
     r = fitz.Rect(rect) & page.rect
     if r.is_empty or r.width < 2 or r.height < 2:
         return True
@@ -190,16 +198,14 @@ def _rect_has_ink(
 
     total_px = pix.width * pix.height
     nonwhite = 0
-
     for i in range(0, len(s), 3):
         if s[i] < white_threshold or s[i + 1] < white_threshold or s[i + 2] < white_threshold:
             nonwhite += 1
-
     return (nonwhite / max(1, total_px)) > nonwhite_ratio
 
 
 # ============================================================
-# Blockers + text envelope
+# Blockers (improved): blocks + words + LINES (new)
 # ============================================================
 
 def _page_text_blocks(page: fitz.Page) -> List[fitz.Rect]:
@@ -214,9 +220,25 @@ def _page_text_blocks(page: fitz.Page) -> List[fitz.Rect]:
 def _page_word_rects(page: fitz.Page) -> List[fitz.Rect]:
     rects: List[fitz.Rect] = []
     try:
-        words = page.get_text("words")  # x0,y0,x1,y1,"word",block,line,wordno
-        for w in words:
+        for w in page.get_text("words"):
             rects.append(fitz.Rect(w[:4]))
+    except Exception:
+        pass
+    return rects
+
+def _page_line_rects(page: fitz.Page) -> List[fitz.Rect]:
+    """
+    NEW: line-level rectangles from text dict.
+    We inflate vertically so "between lines" is treated as unsafe.
+    """
+    rects: List[fitz.Rect] = []
+    try:
+        d = page.get_text("dict")
+        for b in d.get("blocks", []):
+            for ln in b.get("lines", []):
+                line_rect = fitz.Rect(ln.get("bbox"))
+                # pad a bit horizontally, and more vertically
+                rects.append(inflate_rect_xy(line_rect, LINE_BLOCKER_PAD_X, LINE_BLOCKER_PAD_Y))
     except Exception:
         pass
     return rects
@@ -225,6 +247,7 @@ def _page_text_shapes(page: fitz.Page) -> List[fitz.Rect]:
     rects: List[fitz.Rect] = []
     rects.extend(_page_text_blocks(page))
     rects.extend(_page_word_rects(page))
+    rects.extend(_page_line_rects(page))  # NEW
     return rects
 
 def _page_images(page: fitz.Page) -> List[fitz.Rect]:
@@ -306,7 +329,7 @@ def _optimize_layout(text: str, box_width: float) -> Tuple[int, str, float, floa
 
 
 # ============================================================
-# Zones (UPDATED): multi-width gutters + top/bottom bands
+# Zones: multi-width gutters + top/bottom bands
 # ============================================================
 
 def _zones(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
@@ -317,52 +340,39 @@ def _zones(page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
 
     # Always consider multiple gutter widths
     for gw in GUTTER_WIDTHS:
-        left_gutter = fitz.Rect(
-            EDGE_PAD,
-            EDGE_PAD,
-            min(pr.width - EDGE_PAD, EDGE_PAD + gw),
-            pr.height - EDGE_PAD,
-        )
-        right_gutter = fitz.Rect(
-            max(EDGE_PAD, pr.width - EDGE_PAD - gw),
-            EDGE_PAD,
-            pr.width - EDGE_PAD,
-            pr.height - EDGE_PAD,
-        )
-        if left_gutter.width > 40:
-            zones.append((f"left_{int(gw)}", left_gutter))
-        if right_gutter.width > 40:
-            zones.append((f"right_{int(gw)}", right_gutter))
+        left = fitz.Rect(EDGE_PAD, EDGE_PAD, min(pr.width - EDGE_PAD, EDGE_PAD + gw), pr.height - EDGE_PAD)
+        right = fitz.Rect(max(EDGE_PAD, pr.width - EDGE_PAD - gw), EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
+        if left.width > 40:
+            zones.append((f"left_{int(gw)}", left))
+        if right.width > 40:
+            zones.append((f"right_{int(gw)}", right))
 
-    # Add top/bottom if envelope exists; do NOT overinflate
+    # top/bottom zones derived from envelope (light inflation only)
     if env is not None and env.get_area() > 0:
         env2 = inflate_rect(env, max(6.0, GAP_FROM_TEXT_BLOCKS * 0.4))
-
         top = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, max(EDGE_PAD, env2.y0))
         bottom = fitz.Rect(EDGE_PAD, min(pr.height - EDGE_PAD, env2.y1), pr.width - EDGE_PAD, pr.height - EDGE_PAD)
-
         if top.height > 30:
             zones.append(("top", top))
         if bottom.height > 30:
             zones.append(("bottom", bottom))
-    else:
+
+    if not zones:
         zones.append(("full", fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)))
 
     return zones
 
 
 # ============================================================
-# Candidate generation + scoring (UPDATED):
-# - grid scan
-# - progressive ink-check
-# - strong side preference
+# Candidate generation + scoring
+# KEY CHANGE: hard side-first selection
 # ============================================================
 
 def _box_width_for_zone(zone_name: str, zone_rect: fitz.Rect) -> float:
     if zone_name.startswith("left") or zone_name.startswith("right"):
-        return min(170.0, max(70.0, zone_rect.width - 8.0))
+        return min(190.0, max(85.0, zone_rect.width - 8.0))  # slightly wider, easier fit
     if zone_name in ("top", "bottom"):
-        return min(260.0, max(120.0, zone_rect.width - 12.0))
+        return min(280.0, max(130.0, zone_rect.width - 12.0))
     return min(220.0, max(110.0, zone_rect.width - 12.0))
 
 def _clamp_rect_to_zone(r: fitz.Rect, z: fitz.Rect) -> Optional[fitz.Rect]:
@@ -406,59 +416,117 @@ def _grid_positions(z: fitz.Rect, w: float, h: float, *, step: float) -> List[fi
         y += step
     return pts
 
-def _pack_fallback_rect(
-    page: fitz.Page,
-    w: float,
-    h: float,
-    blockers: List[fitz.Rect],
-    occupied_callouts: List[fitz.Rect],
-) -> fitz.Rect:
+def _pack_fallback_rect(page: fitz.Page, w: float, h: float, blockers: List[fitz.Rect], occupied: List[fitz.Rect]) -> fitz.Rect:
     pr = page.rect
     safe = fitz.Rect(EDGE_PAD, EDGE_PAD, pr.width - EDGE_PAD, pr.height - EDGE_PAD)
-    occ_buf = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied_callouts]
+    occ_buf = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied]
 
-    step = 14.0
-    pts = _grid_positions(safe, w, h, step=step)
-
+    pts = _grid_positions(safe, w, h, step=14.0)
     for c in pts:
-        cand = fitz.Rect(c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2)
+        cand = fitz.Rect(c.x - w/2, c.y - h/2, c.x + w/2, c.y + h/2)
         cand = _clamp_rect_to_zone(cand, safe)
         if not cand:
             continue
-        if _intersects_any(cand, blockers):
+        if _intersects_any(cand, blockers) or _intersects_any(cand, occ_buf):
             continue
-        if _intersects_any(cand, occ_buf):
-            continue
-
+        # relaxed ink check
         thr, ratio = INKCHECK_LEVELS[-1]
         if _rect_has_ink(page, inflate_rect(cand, INKCHECK_PAD), dpi=INKCHECK_DPI, white_threshold=thr, nonwhite_ratio=ratio):
             continue
         return cand
 
+    # last-ditch: no overlap with blockers/occupied
     for c in pts:
-        cand = fitz.Rect(c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2)
+        cand = fitz.Rect(c.x - w/2, c.y - h/2, c.x + w/2, c.y + h/2)
         cand = _clamp_rect_to_zone(cand, safe)
         if not cand:
             continue
-        if _intersects_any(cand, blockers):
-            continue
-        if _intersects_any(cand, occ_buf):
+        if _intersects_any(cand, blockers) or _intersects_any(cand, occ_buf):
             continue
         return cand
 
-    n = len(occupied_callouts)
+    n = len(occupied)
     x0 = EDGE_PAD + (n % 6) * (w + 6.0)
     y0 = EDGE_PAD + (n // 6) * (h + 6.0)
     return fitz.Rect(x0, y0, x0 + w, y0 + h)
 
-def _choose_best_spot(
+def _find_candidates_in_zone(
     page: fitz.Page,
-    targets: List[fitz.Rect],
-    occupied_callouts: List[fitz.Rect],
+    zone_name: str,
+    z: fitz.Rect,
+    target_union: fitz.Rect,
+    blockers: List[fitz.Rect],
+    highlight_blockers: List[fitz.Rect],
+    occupied_buf: List[fitz.Rect],
+    connector_obstacles: List[fitz.Rect],
     label: str,
-) -> Tuple[fitz.Rect, str, int, bool]:
-    target_union = _union_rect(targets)
+) -> List[Tuple[float, fitz.Rect, str, int, bool]]:
+    """
+    Return scored candidates for one zone.
+    """
+    bw = _box_width_for_zone(zone_name, z)
+    fs, wrapped, w, h = _optimize_layout(label, bw)
+    if z.width < w + 2 or z.height < h + 2:
+        return []
+
+    GRID_STEP = 18.0
+    pts = _grid_positions(z, w, h, step=GRID_STEP)
     tc = _center(target_union)
+    pts.sort(key=lambda p: abs(p.y - tc.y) + 0.25 * abs(p.x - tc.x))
+
+    is_gutter = zone_name.startswith("left") or zone_name.startswith("right")
+    levels = INKCHECK_LEVELS_GUTTER if is_gutter else INKCHECK_LEVELS
+
+    out: List[Tuple[float, fitz.Rect, str, int, bool]] = []
+
+    for (white_thr, nonwhite_ratio) in levels:
+        for c in pts[:600]:
+            cand = fitz.Rect(c.x - w/2, c.y - h/2, c.x + w/2, c.y + h/2)
+            cand = _clamp_rect_to_zone(cand, z)
+            if not cand:
+                continue
+
+            # hard constraints
+            if _intersects_any(cand, blockers):
+                continue
+            if _intersects_any(cand, occupied_buf):
+                continue
+            if _intersects_any(cand, highlight_blockers):
+                continue
+
+            if _rect_has_ink(
+                page,
+                inflate_rect(cand, INKCHECK_PAD),
+                dpi=INKCHECK_DPI,
+                white_threshold=white_thr,
+                nonwhite_ratio=nonwhite_ratio,
+            ):
+                continue
+
+            s, e, hits, length = _straight_connector_best_pair(cand, target_union, connector_obstacles)
+
+            for tb in _page_text_shapes(page):
+                if _segment_hits_rect(s, e, tb):
+                    hits += 2
+
+            # scoring: fewer crossings, shorter line, closer vertically
+            score = (hits * 7000.0) + length + abs((_center(cand).y - tc.y) * 0.8)
+
+            # strong side preference: make side “win” inside its own group too
+            if is_gutter:
+                score -= 900.0
+
+            out.append((score, cand, wrapped, fs, True))
+
+        # if we found some, stop relaxing further for this zone
+        if out:
+            break
+
+    out.sort(key=lambda x: x[0])
+    return out
+
+def _choose_best_spot(page: fitz.Page, targets: List[fitz.Rect], occupied_callouts: List[fitz.Rect], label: str) -> Tuple[fitz.Rect, str, int, bool]:
+    target_union = _union_rect(targets)
 
     blockers = _page_blockers(page)
     highlight_blockers = [inflate_rect(t, GAP_FROM_HIGHLIGHTS) for t in targets]
@@ -474,64 +542,39 @@ def _choose_best_spot(
 
     zones = _zones(page)
 
-    GRID_STEP = 18.0
-    candidates: List[Tuple[float, fitz.Rect, str, int, bool]] = []
+    # -----------------------------
+    # HARD SIDE-FIRST POLICY
+    # -----------------------------
+    side_zones = [(n, r) for (n, r) in zones if n.startswith("left") or n.startswith("right")]
+    other_zones = [(n, r) for (n, r) in zones if n not in [x[0] for x in side_zones]]
 
-    for zone_name, z in zones:
-        bw = _box_width_for_zone(zone_name, z)
-        fs, wrapped, w, h = _optimize_layout(label, bw)
+    # 1) Try ALL side zones first; if any candidates exist, pick best and return.
+    side_candidates: List[Tuple[float, fitz.Rect, str, int, bool]] = []
+    for zn, zr in side_zones:
+        side_candidates.extend(
+            _find_candidates_in_zone(
+                page, zn, zr, target_union, blockers, highlight_blockers, occupied_buf, connector_obstacles, label
+            )
+        )
+    side_candidates.sort(key=lambda x: x[0])
+    if side_candidates:
+        _, best_rect, wrapped, fs, safe = side_candidates[0]
+        return best_rect, wrapped, fs, safe
 
-        if z.width < w + 2 or z.height < h + 2:
-            continue
+    # 2) Only if no side candidates exist, consider top/bottom/full
+    other_candidates: List[Tuple[float, fitz.Rect, str, int, bool]] = []
+    for zn, zr in other_zones:
+        other_candidates.extend(
+            _find_candidates_in_zone(
+                page, zn, zr, target_union, blockers, highlight_blockers, occupied_buf, connector_obstacles, label
+            )
+        )
+    other_candidates.sort(key=lambda x: x[0])
+    if other_candidates:
+        _, best_rect, wrapped, fs, safe = other_candidates[0]
+        return best_rect, wrapped, fs, safe
 
-        pts = _grid_positions(z, w, h, step=GRID_STEP)
-        pts.sort(key=lambda p: abs(p.y - tc.y) + 0.25 * abs(p.x - tc.x))
-
-        for (white_thr, nonwhite_ratio) in INKCHECK_LEVELS:
-            for c in pts[:450]:
-                cand = fitz.Rect(c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2)
-                cand = _clamp_rect_to_zone(cand, z)
-                if not cand:
-                    continue
-
-                if _intersects_any(cand, blockers):
-                    continue
-                if _intersects_any(cand, occupied_buf):
-                    continue
-                if _intersects_any(cand, highlight_blockers):
-                    continue
-
-                if _rect_has_ink(
-                    page,
-                    inflate_rect(cand, INKCHECK_PAD),
-                    dpi=INKCHECK_DPI,
-                    white_threshold=white_thr,
-                    nonwhite_ratio=nonwhite_ratio,
-                ):
-                    continue
-
-                s, e, hits, length = _straight_connector_best_pair(cand, target_union, connector_obstacles)
-
-                for tb in _page_text_shapes(page):
-                    if _segment_hits_rect(s, e, tb):
-                        hits += 2
-
-                score = (hits * 7000.0) + length + abs((_center(cand).y - tc.y) * 0.8)
-
-                # STRONG side preference (UPDATED)
-                if zone_name.startswith("left") or zone_name.startswith("right"):
-                    score -= 450.0
-
-                candidates.append((score, cand, wrapped, fs, True))
-
-            if len(candidates) >= 6:
-                break
-
-    candidates.sort(key=lambda x: x[0])
-    if candidates:
-        _, best_rect, wrapped, fs, safe_for_white_bg = candidates[0]
-        return best_rect, wrapped, fs, safe_for_white_bg
-
+    # 3) Packed fallback (no stacking)
     bw = 170.0
     fs, wrapped, w, h = _optimize_layout(label, bw)
     fb = _pack_fallback_rect(page, w, h, blockers, occupied_callouts)
@@ -636,12 +679,7 @@ def _url_variants(url: str) -> List[str]:
 # Main entrypoint
 # ============================================================
 
-def annotate_pdf_bytes(
-    pdf_bytes: bytes,
-    quote_terms: List[str],
-    criterion_id: str,
-    meta: Dict,
-) -> Tuple[bytes, Dict]:
+def annotate_pdf_bytes(pdf_bytes: bytes, quote_terms: List[str], criterion_id: str, meta: Dict) -> Tuple[bytes, Dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     if len(doc) == 0:
         return pdf_bytes, {}
@@ -661,12 +699,7 @@ def annotate_pdf_bytes(
                 total_quote_hits += 1
 
     # B) Metadata callouts (page 1)
-    def _do_job(
-        label: str,
-        needles: List[str],
-        *,
-        connect_policy: str = "union",  # "single" | "union" | "all"
-    ):
+    def _do_job(label: str, needles: List[str], *, connect_policy: str = "union"):
         nonlocal total_meta_hits, occupied_callouts
 
         targets: List[fitz.Rect] = []
@@ -682,9 +715,7 @@ def annotate_pdf_bytes(
             page1.draw_rect(t, color=RED, width=BOX_WIDTH)
         total_meta_hits += len(targets)
 
-        callout_rect, wrapped_text, fs, safe_for_white_bg = _choose_best_spot(
-            page1, targets, occupied_callouts, label
-        )
+        callout_rect, wrapped_text, fs, safe_for_white_bg = _choose_best_spot(page1, targets, occupied_callouts, label)
 
         if safe_for_white_bg:
             page1.draw_rect(callout_rect, color=WHITE, fill=WHITE, overlay=True)
@@ -703,8 +734,7 @@ def annotate_pdf_bytes(
             obstacles.append(inflate_rect(b, 1.5))
         for o in occupied_callouts:
             obstacles.append(inflate_rect(o, 2.0))
-        expanded_targets = [inflate_rect(t, 2.5) for t in targets]
-        obstacles.extend(expanded_targets)
+        obstacles.extend([inflate_rect(t, 2.5) for t in targets])
 
         def connect_to(rect: fitz.Rect):
             _draw_straight_connector(page1, callout_rect, rect, obstacles)
@@ -728,31 +758,19 @@ def annotate_pdf_bytes(
     venue = (meta.get("venue_name") or "").strip()
     org = (meta.get("org_name") or "").strip()
     if venue or org:
-        _do_job(
-            "The distinguished organization.",
-            [venue, org],
-            connect_policy="union",
-        )
+        _do_job("The distinguished organization.", [venue, org], connect_policy="union")
 
     perf = (meta.get("performance_date") or "").strip()
     if perf:
-        _do_job(
-            "Performance date.",
-            [perf],
-            connect_policy="union",
-        )
+        _do_job("Performance date.", [perf], connect_policy="union")
 
     sal = (meta.get("salary_amount") or "").strip()
     if sal:
-        _do_job(
-            "Beneficiary salary evidence.",
-            [sal],
-            connect_policy="union",
-        )
+        _do_job("Beneficiary salary evidence.", [sal], connect_policy="union")
 
     bname = (meta.get("beneficiary_name") or "").strip()
     variants = meta.get("beneficiary_variants") or []
-    needles = []
+    needles: List[str] = []
     if bname:
         needles.append(bname)
     for v in variants:
@@ -768,11 +786,7 @@ def annotate_pdf_bytes(
                 seen.add(x)
                 uniq.append(x)
 
-        _do_job(
-            "Beneficiary lead role evidence.",
-            uniq,
-            connect_policy="all",
-        )
+        _do_job("Beneficiary lead role evidence.", uniq, connect_policy="all")
 
     out = io.BytesIO()
     doc.save(out)
