@@ -12,9 +12,11 @@ from openai import OpenAI
 # Secrets helper
 # -----------------------------
 def _get_secret(name: str):
-    # Works on Streamlit Cloud (st.secrets) and locally (.env / env vars)
+    """
+    Works on Streamlit Cloud (st.secrets) and locally (.env / env vars).
+    """
     try:
-        import streamlit as st
+        import streamlit as st  # noqa: F401
         if name in st.secrets:
             return st.secrets[name]
     except Exception:
@@ -55,7 +57,9 @@ def make_csv_template(filenames: list[str]) -> bytes:
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["filename", "source_url", "venue_name", "performance_date", "org_name", "salary_amount"])
+    writer.writerow(
+        ["filename", "source_url", "venue_name", "performance_date", "org_name", "salary_amount"]
+    )
     for fn in filenames:
         writer.writerow([fn, "", "", "", "", ""])
     return buf.getvalue().encode("utf-8")
@@ -70,7 +74,8 @@ def parse_metadata_csv(csv_bytes: bytes) -> Dict[str, Dict]:
     reader = csv.DictReader(io.StringIO(text))
 
     required = {"filename", "source_url", "venue_name", "performance_date", "org_name", "salary_amount"}
-    if not required.issubset(set(reader.fieldnames or [])):
+    headers = set(reader.fieldnames or [])
+    if not required.issubset(headers):
         raise ValueError(f"CSV must include headers: {sorted(required)}")
 
     out: Dict[str, Dict] = {}
@@ -123,12 +128,12 @@ def merge_metadata(
 
 
 # ============================================================
-# PART B: AI metadata auto-detect (Fixed for OpenAI v1.0+)
+# PART B: AI metadata auto-detect (OpenAI Python SDK v1+)
 # ============================================================
 
 _AUTODETECT_SYSTEM = (
     "You extract structured metadata from USCIS O-1 evidence PDFs. "
-    "Return ONLY valid JSON. If a field is not found, return an empty string."
+    "Return ONLY valid JSON. If reminder: If a field is not found, use an empty string."
 )
 
 _AUTODETECT_USER = """Extract metadata from the following document text.
@@ -152,37 +157,51 @@ DOCUMENT TEXT:
 """
 
 
-def autodetect_metadata(document_text: str) -> Dict:
+def autodetect_metadata(
+    document_text: str,
+    *,
+    model: Optional[str] = None,
+    max_chars: int = 20000,
+    debug: bool = False,
+) -> Dict:
     """
     Optional AI step: extracts metadata candidates from document text.
+
+    Parameters:
+      - model: override model name (defaults to OPENAI_MODEL or gpt-4o-mini)
+      - max_chars: truncate input text for cost/speed
+      - debug: if True, raise exceptions instead of swallowing them
+
+    Returns dict with keys:
+      source_url, venue_name, performance_date, org_name, salary_amount
     """
     api_key = _get_secret("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    # Corrected model name: gpt-4o-mini
-    model = _get_secret("OPENAI_MODEL") or "gpt-4o-mini"
+    chosen_model = model or _get_secret("OPENAI_MODEL") or "gpt-4o-mini"
     client = OpenAI(api_key=api_key)
 
-    prompt = _AUTODETECT_USER.format(text=(document_text or "")[:20000])
+    prompt = _AUTODETECT_USER.format(text=(document_text or "")[:max_chars])
 
     try:
-        # Standard Chat Completion API call
         resp = client.chat.completions.create(
-            model=model,
+            model=chosen_model,
             messages=[
                 {"role": "system", "content": _AUTODETECT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
         )
-        
-        # Corrected way to access the response content
-        raw = resp.choices[0].message.content
-        data = json.loads(raw) if raw else {}
+
+        raw = resp.choices[0].message.content or "{}"
+        data = json.loads(raw)
+
     except Exception as e:
-        # Print the error to Streamlit logs for debugging
-        print(f"Metadata Extraction Error: {e}")
+        # Streamlit Cloud logs will capture prints
+        print(f"[autodetect_metadata] Error: {e}")
+        if debug:
+            raise
         data = {}
 
     def s(key: str) -> str:
