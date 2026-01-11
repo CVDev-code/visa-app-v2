@@ -243,14 +243,12 @@ def _choose_best_margin_spot(
 ) -> Tuple[fitz.Rect, str, int, bool]:
     pr = page.rect
     target_union = _union_rect(targets)
-    # The ideal Y position (vertical center of the highlighted text)
     target_y = (target_union.y0 + target_union.y1) / 2
 
     margin_w = 130.0
     left_x = EDGE_PAD
     right_x = pr.width - EDGE_PAD - margin_w
 
-    # Identify all "blockers" (existing text, images, other annotations)
     blockers = _page_blockers(page, pad=GAP_FROM_TEXT_BLOCKS)
     for t in targets:
         blockers.append(inflate_rect(t, GAP_FROM_HIGHLIGHTS))
@@ -267,57 +265,22 @@ def _choose_best_margin_spot(
         return rr
 
     candidates = []
-
-    # SEARCH STRATEGY: 
-    # Instead of checking only offset "0", we check offsets up and down 
-    # (e.g., 0, +10, -10, +20, -20 ... up to +/- 250 units)
-    search_steps = [0]
-    for i in range(1, 26):
-        search_steps.append(i * 10.0)
-        search_steps.append(i * -10.0)
-
-    # Try both Left and Right margins
     for x_start in [left_x, right_x]:
         fs, wrapped, w, h = _optimize_layout_for_margin(label, margin_w)
-        
-        best_for_side = None
+        cand = fitz.Rect(x_start, target_y - h / 2, x_start + w, target_y + h / 2)
+        cand = clamp(cand)
 
-        # Scan vertical offsets to find a "safe" spot
-        for dy in search_steps:
-            # Shift the candidate box by dy
-            y_center = target_y + dy
-            cand = fitz.Rect(x_start, y_center - h / 2, x_start + w, y_center + h / 2)
-            cand = clamp(cand)
+        safe = (not _intersects_any(cand, blockers)) and (not _intersects_any(cand, occupied_buf))
+        score = abs(target_y - (cand.y0 + cand.y1) / 2) + (0 if safe else 1e9)
+        candidates.append((score, cand, wrapped, fs, safe))
 
-            # Check if this specific spot hits any text or existing box
-            safe = (not _intersects_any(cand, blockers)) and (not _intersects_any(cand, occupied_buf))
-            
-            # Calculate how far we drifted from the target (we want this low)
-            dist = abs(target_y - (cand.y0 + cand.y1) / 2)
-            
-            # Scoring:
-            # If SAFE, score = distance (lower is better).
-            # If UNSAFE, score = distance + 1,000,000 (huge penalty).
-            score = dist + (0 if safe else 1_000_000)
-
-            # Keep the best spot found so far for this side
-            if best_for_side is None or score < best_for_side[0]:
-                best_for_side = (score, cand, wrapped, fs, safe)
-            
-            # Optimization: If we found a safe spot very close, stop searching this side
-            if safe and dist < 5.0:
-                break
-        
-        if best_for_side:
-            candidates.append(best_for_side)
-
-    # Compare Left vs Right results and pick the one with the lowest score
     candidates.sort(key=lambda x: x[0])
     score, cand, wrapped, fs, safe = candidates[0]
 
-    # 'safe' will now be True much more often because we searched for a gap.
-    # If it is still False (score > 1,000,000), it means the page is totally full.
-    
+    # If not safe, don't paint white background (still place text)
+    if score >= 1e9:
+        safe = False
+
     return cand, wrapped, fs, safe
 
 
