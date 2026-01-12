@@ -9,17 +9,25 @@ RED = (1, 0, 0)
 WHITE = (1, 1, 1)
 
 # ---- style knobs ----
-BOX_WIDTH = 1.7          # thickness for red rectangles
-LINE_WIDTH = 1.6         # thickness for connectors
-FONTNAME = "Times-Bold"  # thicker than Times-Roman
-FONT_SIZES = [12, 11, 10]
+BOX_WIDTH = 1.7
+LINE_WIDTH = 1.6
+FONTNAME = "Times-Bold"
+FONT_SIZES = [12, 11, 10, 9, 8]
+
+# ---- footer no-go zone (page coordinates; PyMuPDF = top-left origin) ----
+NO_GO_RECT = fitz.Rect(
+    21.00,   # left
+    816.00,  # top
+    411.26,  # right
+    830.00   # bottom
+)
 
 # ---- spacing knobs ----
-EDGE_PAD = 18.0
-GAP_FROM_TEXT_BLOCKS = 10.0
-GAP_FROM_HIGHLIGHTS = 14.0
-GAP_BETWEEN_CALLOUTS = 10.0
-ENDPOINT_PULLBACK = 1.5   # pull line end slightly away from box interior
+EDGE_PAD = 12.0
+GAP_FROM_TEXT_BLOCKS = 8.0
+GAP_FROM_HIGHLIGHTS = 10.0
+GAP_BETWEEN_CALLOUTS = 8.0
+ENDPOINT_PULLBACK = 1.5
 
 # For quote search robustness
 _MAX_TERM = 600
@@ -53,18 +61,6 @@ def _center(rect: fitz.Rect) -> fitz.Point:
     return fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
 
 
-def _segment_hits_rect(p1: fitz.Point, p2: fitz.Point, r: fitz.Rect) -> bool:
-    """Sample points along segment; good enough for routing decisions."""
-    steps = 22
-    for i in range(steps + 1):
-        t = i / steps
-        x = p1.x + (p2.x - p1.x) * t
-        y = p1.y + (p2.y - p1.y) * t
-        if r.contains(fitz.Point(x, y)):
-            return True
-    return False
-
-
 def _pull_back_point(from_pt: fitz.Point, to_pt: fitz.Point, dist: float) -> fitz.Point:
     vx = from_pt.x - to_pt.x
     vy = from_pt.y - to_pt.y
@@ -75,217 +71,431 @@ def _pull_back_point(from_pt: fitz.Point, to_pt: fitz.Point, dist: float) -> fit
     return fitz.Point(to_pt.x + ux * dist, to_pt.y + uy * dist)
 
 
-def _mid_edge_anchor(callout: fitz.Rect, toward: fitz.Point) -> fitz.Point:
-    """Mid-height on left or right edge of callout box."""
-    y = callout.y0 + (callout.height / 2.0)
-    cx = callout.x0 + callout.width / 2.0
-    if toward.x >= cx:
-        return fitz.Point(callout.x1, y)
-    return fitz.Point(callout.x0, y)
+def _segment_hits_rect(p1: fitz.Point, p2: fitz.Point, r: fitz.Rect, steps: int = 28) -> bool:
+    """Sample points along segment; good enough for scoring line crossings."""
+    for i in range(steps + 1):
+        t = i / steps
+        x = p1.x + (p2.x - p1.x) * t
+        y = p1.y + (p2.y - p1.y) * t
+        if r.contains(fitz.Point(x, y)):
+            return True
+    return False
 
 
-def _edge_candidates(rect: fitz.Rect) -> List[fitz.Point]:
-    """Edge points for sampling endpoints (midpoints + slight corner bias)."""
-    cx = rect.x0 + rect.width / 2.0
-    cy = rect.y0 + rect.height / 2.0
-    return [
-        fitz.Point(rect.x0, cy),
-        fitz.Point(rect.x1, cy),
-        fitz.Point(cx, rect.y0),
-        fitz.Point(cx, rect.y1),
-        fitz.Point(rect.x0, rect.y0),
-        fitz.Point(rect.x1, rect.y0),
-        fitz.Point(rect.x0, rect.y1),
-        fitz.Point(rect.x1, rect.y1),
-    ]
+def _shift_rect_up(rect: fitz.Rect, shift: float, min_y: float = 2.0) -> fitz.Rect:
+    """Shift rect upwards by `shift` points, clamped to min_y."""
+    if shift <= 0:
+        return fitz.Rect(rect)
+    h = rect.y1 - rect.y0
+    new_y1 = max(min_y + h, rect.y1 - shift)
+    return fitz.Rect(rect.x0, new_y1 - h, rect.x1, new_y1)
 
 
-def _straight_connector_best_pair(
-    callout_rect: fitz.Rect,
-    target_rect: fitz.Rect,
-    obstacles: List[fitz.Rect],
-) -> Tuple[fitz.Point, fitz.Point]:
+# ============================================================
+# HARD SAFETY: never pass invalid rects into insert_textbox
+# ============================================================
+
+def _rect_is_valid(r: fitz.Rect) -> bool:
+    vals = [r.x0, r.y0, r.x1, r.y1]
+    return (
+        all(math.isfinite(v) for v in vals)
+        and (r.x1 > r.x0)
+        and (r.y1 > r.y0)
+    )
+
+
+def _ensure_min_size(
+    r: fitz.Rect,
+    pr: fitz.Rect,
+    min_w: float = 20.0,
+    min_h: float = 12.0,
+    pad: float = 2.0,
+) -> fitz.Rect:
     """
-    ALWAYS returns a straight segment (start,end) that minimizes crossings.
-    We sample multiple start points along the callout side and multiple end points on target edge.
+    Repairs inverted / collapsed rects and clamps to the page.
+    Guarantees width/height >= min_w/min_h unless the page is impossibly small.
     """
-    target_center = _center(target_rect)
+    rr = fitz.Rect(r)
 
-    # sample a few start points around the mid-height to avoid cutting through adjacent boxes
-    base = _mid_edge_anchor(callout_rect, target_center)
-    # allow small vertical nudges (still on edge)
-    nudges = [-14.0, -7.0, 0.0, 7.0, 14.0]
-    starts: List[fitz.Point] = []
-    for dy in nudges:
-        y = min(max(callout_rect.y0 + 2.0, base.y + dy), callout_rect.y1 - 2.0)
-        starts.append(fitz.Point(base.x, y))
+    cx = (rr.x0 + rr.x1) / 2.0
+    cy = (rr.y0 + rr.y1) / 2.0
+    w = max(min_w, abs(rr.x1 - rr.x0))
+    h = max(min_h, abs(rr.y1 - rr.y0))
 
-    ends = _edge_candidates(target_rect)
+    rr = fitz.Rect(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
 
-    best = (10**9, 10**9, starts[0], ends[0])  # (hits, length, start, end)
-    for s in starts:
-        for e in ends:
-            # Count obstacle crossings
-            hits = 0
-            for ob in obstacles:
-                if _segment_hits_rect(s, e, ob):
-                    hits += 1
+    # Clamp to page
+    rr.x0 = max(pad, rr.x0)
+    rr.y0 = max(pad, rr.y0)
+    rr.x1 = min(pr.width - pad, rr.x1)
+    rr.y1 = min(pr.height - pad, rr.y1)
 
-            length = math.hypot(e.x - s.x, e.y - s.y)
+    # If clamping collapsed it, force a tiny safe box near top-left margin
+    if rr.x1 <= rr.x0 or rr.y1 <= rr.y0:
+        rr = fitz.Rect(pad, pad, pad + min_w, pad + min_h)
 
-            # primary: minimize hits, secondary: shortest line
-            if hits < best[0] or (hits == best[0] and length < best[1]):
-                best = (hits, length, s, e)
-
-    s = best[2]
-    e = best[3]
-    e = _pull_back_point(s, e, ENDPOINT_PULLBACK)
-    return s, e
-
-
-def _draw_straight_connector(
-    page: fitz.Page,
-    callout_rect: fitz.Rect,
-    target_rect: fitz.Rect,
-    obstacles: List[fitz.Rect],
-):
-    s, e = _straight_connector_best_pair(callout_rect, target_rect, obstacles)
-    page.draw_line(s, e, color=RED, width=LINE_WIDTH)
+    return rr
 
 
 # ============================================================
-# Page blockers (for callout placement)
+# Text area detection (dynamic margins)
 # ============================================================
 
-def _page_blockers(page: fitz.Page, pad: float = GAP_FROM_TEXT_BLOCKS) -> List[fitz.Rect]:
-    blockers: List[fitz.Rect] = []
+def _get_fallback_text_area(page: fitz.Page) -> fitz.Rect:
+    pr = page.rect
+    return fitz.Rect(
+        pr.width * 0.12,
+        pr.height * 0.12,
+        pr.width * 0.88,
+        pr.height * 0.88,
+    )
 
-    # Text blocks
+
+def _detect_actual_text_area(page: fitz.Page) -> fitz.Rect:
+    """
+    Detect body text area by analyzing words (robust percentiles).
+    Ignores top/bottom ~12% to avoid header/footer.
+    """
     try:
-        for b in page.get_text("blocks"):
-            blockers.append(inflate_rect(fitz.Rect(b[:4]), pad))
+        words = page.get_text("words") or []
+        if not words:
+            return _get_fallback_text_area(page)
+
+        pr = page.rect
+        header_limit = pr.height * 0.12
+        footer_limit = pr.height * 0.88
+
+        x0s, x1s = [], []
+        for w in words:
+            x0, y0, x1, y1, text = w[:5]
+            if y0 > header_limit and y1 < footer_limit and len((text or "").strip()) > 1:
+                x0s.append(float(x0))
+                x1s.append(float(x1))
+
+        if not x0s:
+            return _get_fallback_text_area(page)
+
+        x0s.sort()
+        x1s.sort()
+
+        li = int(len(x0s) * 0.05)
+        ri = int(len(x1s) * 0.95)
+
+        text_left = x0s[max(0, li)]
+        text_right = x1s[min(len(x1s) - 1, ri)]
+
+        text_left = max(pr.width * 0.08, text_left)
+        text_right = min(pr.width * 0.92, text_right)
+
+        if text_right <= text_left + 50:
+            return _get_fallback_text_area(page)
+
+        return fitz.Rect(text_left, header_limit, text_right, footer_limit)
     except Exception:
-        pass
-
-    # Images
-    try:
-        for img in page.get_images(full=True):
-            xref = img[0]
-            try:
-                for r in page.get_image_rects(xref):
-                    blockers.append(inflate_rect(fitz.Rect(r), pad))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Vector drawings
-    try:
-        for d in page.get_drawings():
-            r = d.get("rect")
-            if r:
-                blockers.append(inflate_rect(fitz.Rect(r), pad))
-    except Exception:
-        pass
-
-    return blockers
-
-
-def _intersects_any(r: fitz.Rect, others: List[fitz.Rect]) -> bool:
-    return any(r.intersects(o) for o in others)
+        return _get_fallback_text_area(page)
 
 
 # ============================================================
-# Callout text wrapping (prefers 12, then 11, then 10)
+# Text wrapping (simple + reliable)
 # ============================================================
 
 def _optimize_layout_for_margin(text: str, box_width: float) -> Tuple[int, str, float, float]:
     """
-    Returns (fontsize, wrapped_text, width, height). Prefers 12 unless too tall.
+    Wrap words to the given width, try font sizes from FONT_SIZES.
+    Returns: (fontsize, wrapped_text, width_used, height_estimate)
     """
     text = (text or "").strip()
     if not text:
         return 12, "", box_width, 24.0
 
+    words = text.split()
+    max_h = 180.0
+
     for fs in FONT_SIZES:
-        words = text.split()
+        usable_w = max(20.0, box_width - 10.0)
         lines: List[str] = []
-        cur: List[str] = []
-        usable_w = max(10.0, box_width - 10.0)
+        cur = ""
 
         for w in words:
-            trial = " ".join(cur + [w])
+            trial = (cur + " " + w).strip() if cur else w
             if fitz.get_text_length(trial, fontname=FONTNAME, fontsize=fs) <= usable_w:
-                cur.append(w)
+                cur = trial
             else:
                 if cur:
-                    lines.append(" ".join(cur))
-                    cur = [w]
-                else:
-                    lines.append(w)
-                    cur = []
+                    lines.append(cur)
+                cur = w
+
         if cur:
-            lines.append(" ".join(cur))
+            lines.append(cur)
 
-        h = (len(lines) * fs * 1.22) + 10.0
-        # If we can keep this reasonably compact, accept this fs
-        if h <= 86.0 or fs == 10:
-            return fs, "\n".join(lines), box_width, h
+        wrapped = "\n".join(lines)
+        h = (len(lines) * fs * 1.25) + 10.0
 
-    return 10, text, box_width, 44.0
+        if h <= max_h or fs == FONT_SIZES[-1]:
+            return fs, wrapped, box_width, h
 
-
-def _choose_best_margin_spot(
-    page: fitz.Page,
-    targets: List[fitz.Rect],
-    occupied: List[fitz.Rect],
-    label: str,
-) -> Tuple[fitz.Rect, str, int, bool]:
-    pr = page.rect
-    target_union = _union_rect(targets)
-    target_y = (target_union.y0 + target_union.y1) / 2
-
-    margin_w = 130.0
-    left_x = EDGE_PAD
-    right_x = pr.width - EDGE_PAD - margin_w
-
-    blockers = _page_blockers(page, pad=GAP_FROM_TEXT_BLOCKS)
-    for t in targets:
-        blockers.append(inflate_rect(t, GAP_FROM_HIGHLIGHTS))
-    occupied_buf = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied]
-
-    def clamp(r: fitz.Rect) -> fitz.Rect:
-        rr = fitz.Rect(r)
-        if rr.y0 < EDGE_PAD:
-            rr.y1 += (EDGE_PAD - rr.y0)
-            rr.y0 = EDGE_PAD
-        if rr.y1 > pr.height - EDGE_PAD:
-            rr.y0 -= (rr.y1 - (pr.height - EDGE_PAD))
-            rr.y1 = pr.height - EDGE_PAD
-        return rr
-
-    candidates = []
-    for x_start in [left_x, right_x]:
-        fs, wrapped, w, h = _optimize_layout_for_margin(label, margin_w)
-        cand = fitz.Rect(x_start, target_y - h / 2, x_start + w, target_y + h / 2)
-        cand = clamp(cand)
-
-        safe = (not _intersects_any(cand, blockers)) and (not _intersects_any(cand, occupied_buf))
-        score = abs(target_y - (cand.y0 + cand.y1) / 2) + (0 if safe else 1e9)
-        candidates.append((score, cand, wrapped, fs, safe))
-
-    candidates.sort(key=lambda x: x[0])
-    score, cand, wrapped, fs, safe = candidates[0]
-
-    # If not safe, don't paint white background (still place text)
-    if score >= 1e9:
-        safe = False
-
-    return cand, wrapped, fs, safe
+    return FONT_SIZES[-1], text, box_width, 44.0
 
 
 # ============================================================
-# Search helpers (robust quote matching)
+# Fit-guaranteed textbox insertion
+# ============================================================
+
+def _insert_textbox_fit(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    *,
+    fontname: str,
+    fontsize: int,
+    color,
+    align=fitz.TEXT_ALIGN_LEFT,
+    overlay: bool = True,
+    max_expand_iters: int = 8,
+    extra_pad_each_iter: float = 6.0,
+) -> Tuple[fitz.Rect, float, int]:
+    """
+    Insert text; if it doesn't fit (negative return), expand vertically and/or shrink font.
+    Returns (final_rect, ret, final_fontsize).
+    """
+    pr = page.rect
+    r = fitz.Rect(rect)
+    fs = int(fontsize)
+
+    # Absolute safety: repair rect before any insert attempt
+    r = _ensure_min_size(r, pr)
+    if not _rect_is_valid(r):
+        return r, -1.0, fs
+
+    def attempt(rr: fitz.Rect, fsize: int) -> float:
+        rr = _ensure_min_size(rr, pr)
+        if not _rect_is_valid(rr):
+            return -1.0
+        return page.insert_textbox(
+            rr,
+            text,
+            fontname=fontname,
+            fontsize=fsize,
+            color=color,
+            align=align,
+            overlay=overlay,
+        )
+
+    ret = attempt(r, fs)
+
+    it = 0
+    while ret < 0 and it < max_expand_iters:
+        need = (-ret) + extra_pad_each_iter
+        r.y0 -= need / 2.0
+        r.y1 += need / 2.0
+        r.y0 = max(2.0, r.y0)
+        r.y1 = min(pr.height - 2.0, r.y1)
+        ret = attempt(r, fs)
+        it += 1
+
+    shrink_tries = 0
+    while ret < 0 and fs > FONT_SIZES[-1] and shrink_tries < 4:
+        fs -= 1
+        r = fitz.Rect(rect)
+        ret = attempt(r, fs)
+
+        it = 0
+        while ret < 0 and it < max_expand_iters:
+            need = (-ret) + extra_pad_each_iter
+            r.y0 -= need / 2.0
+            r.y1 += need / 2.0
+            r.y0 = max(2.0, r.y0)
+            r.y1 = min(pr.height - 2.0, r.y1)
+            ret = attempt(r, fs)
+            it += 1
+
+        shrink_tries += 1
+
+    return r, ret, fs
+
+
+# ============================================================
+# Edge-to-edge connector
+# ============================================================
+
+def _connector_endpoints_edge_to_edge(callout_rect: fitz.Rect, target_rect: fitz.Rect) -> Tuple[fitz.Point, fitz.Point]:
+    tc = _center(target_rect)
+    cc = _center(callout_rect)
+
+    cy = cc.y
+    if callout_rect.x1 <= target_rect.x0:
+        start = fitz.Point(callout_rect.x1, cy)
+    elif callout_rect.x0 >= target_rect.x1:
+        start = fitz.Point(callout_rect.x0, cy)
+    else:
+        if cc.y < tc.y:
+            start = fitz.Point(cc.x, callout_rect.y1)
+        else:
+            start = fitz.Point(cc.x, callout_rect.y0)
+
+    y_on_target = min(max(cy, target_rect.y0 + 1.0), target_rect.y1 - 1.0)
+
+    if callout_rect.x1 <= target_rect.x0:
+        end = fitz.Point(target_rect.x0, y_on_target)
+    elif callout_rect.x0 >= target_rect.x1:
+        end = fitz.Point(target_rect.x1, y_on_target)
+    else:
+        x_on_target = min(max(cc.x, target_rect.x0 + 1.0), target_rect.x1 - 1.0)
+        if cc.y < tc.y:
+            end = fitz.Point(x_on_target, target_rect.y0)
+        else:
+            end = fitz.Point(x_on_target, target_rect.y1)
+
+    end = _pull_back_point(start, end, ENDPOINT_PULLBACK)
+    return start, end
+
+
+def _draw_connector(page: fitz.Page, callout_rect: fitz.Rect, target_rect: fitz.Rect):
+    s, e = _connector_endpoints_edge_to_edge(callout_rect, target_rect)
+    page.draw_line(s, e, color=RED, width=LINE_WIDTH)
+
+
+# ============================================================
+# Margin placement
+# ============================================================
+
+def _place_annotation_in_margin(
+    page: fitz.Page,
+    targets: List[fitz.Rect],
+    occupied_callouts: List[fitz.Rect],
+    label: str,
+) -> Tuple[fitz.Rect, str, int, bool]:
+    text_area = _detect_actual_text_area(page)
+    pr = page.rect
+    target_union = _union_rect(targets)
+    target_c = _center(target_union)
+    target_y = target_c.y
+
+    target_no_go = inflate_rect(target_union, GAP_FROM_HIGHLIGHTS)
+    footer_no_go = fitz.Rect(NO_GO_RECT) & pr
+
+    MIN_CALLOUT_WIDTH = 55.0
+    MAX_CALLOUT_WIDTH = 180.0
+    EDGE_BUFFER = 8.0
+    MIN_H = 12.0
+
+    left_lane = (EDGE_BUFFER, max(EDGE_BUFFER, text_area.x0 - EDGE_BUFFER))
+    right_lane = (min(pr.width - EDGE_BUFFER, text_area.x1 + EDGE_BUFFER), pr.width - EDGE_BUFFER)
+
+    lanes = []
+    lw = left_lane[1] - left_lane[0]
+    rw = right_lane[1] - right_lane[0]
+    if lw >= MIN_CALLOUT_WIDTH:
+        lanes.append(("left", left_lane[0], left_lane[1], lw))
+    if rw >= MIN_CALLOUT_WIDTH:
+        lanes.append(("right", right_lane[0], right_lane[1], rw))
+
+    if not lanes:
+        fallback = fitz.Rect(
+            EDGE_BUFFER,
+            max(EDGE_BUFFER, target_y - 20),
+            EDGE_BUFFER + 120,
+            min(pr.height - EDGE_BUFFER, target_y + 20),
+        )
+        return _ensure_min_size(fallback, pr), label, 8, False
+
+    page_mid_x = pr.width / 2.0
+    target_side_pref = "left" if target_c.x < page_mid_x else "right"
+    lanes.sort(key=lambda t: 0 if t[0] == target_side_pref else 1)
+
+    occupied_buf = [inflate_rect(o, GAP_BETWEEN_CALLOUTS) for o in occupied_callouts]
+
+    scan = [12, -12, 24, -24, 36, -36, 48, -48, 60, -60, 72, -72, 0]
+
+    best = None  # (score, rect, wrapped, fs, safe)
+
+    for side, x0_lane, x1_lane, lane_w in lanes:
+        usable_w = min(MAX_CALLOUT_WIDTH, lane_w)
+        fs, wrapped_text, w_used, h_needed = _optimize_layout_for_margin(label, usable_w)
+        w_used = min(w_used, usable_w)
+        if w_used < MIN_CALLOUT_WIDTH:
+            continue
+
+        for dy in scan:
+            y0 = target_y + dy - h_needed / 2.0
+            y1 = target_y + dy + h_needed / 2.0
+
+            # clamp
+            y0 = max(EDGE_BUFFER, y0)
+            y1 = min(pr.height - EDGE_BUFFER, y1)
+
+            # prevent collapse/inversion after clamping
+            if (y1 - y0) < MIN_H:
+                y1 = min(pr.height - EDGE_BUFFER, y0 + MIN_H)
+                if (y1 - y0) < MIN_H:
+                    y0 = max(EDGE_BUFFER, y1 - MIN_H)
+
+            if side == "left":
+                x1 = x1_lane - 5.0
+                x0 = max(x0_lane, x1 - w_used)
+            else:
+                x0 = x0_lane + 5.0
+                x1 = min(x1_lane, x0 + w_used)
+
+            cand = fitz.Rect(x0, y0, x1, y1)
+            cand = _ensure_min_size(cand, pr)
+
+            # stay out of highlights / body text / footer no-go
+            if cand.intersects(target_no_go):
+                continue
+            if cand.intersects(text_area):
+                continue
+            if footer_no_go.width > 0 and footer_no_go.height > 0 and cand.intersects(footer_no_go):
+                continue
+
+            conflicts = any(cand.intersects(o) for o in occupied_buf)
+            safe = not conflicts
+
+            dx = abs(_center(cand).x - target_c.x)
+            dy_zero_penalty = 5.0 if dy == 0 else 0.0
+            score = (0 if safe else 10_000) + dx * 0.8 + abs(dy) * 0.15 + dy_zero_penalty
+
+            if best is None or score < best[0]:
+                best = (score, cand, wrapped_text, fs, safe)
+
+            if safe and dy != 0:
+                return cand, wrapped_text, fs, True
+
+    if best:
+        _, cand, wrapped_text, fs, safe = best
+        return cand, wrapped_text, fs, safe
+
+    # last resort fallback
+    side, x0_lane, x1_lane, lane_w = lanes[0]
+    usable_w = min(MAX_CALLOUT_WIDTH, lane_w)
+    fs, wrapped_text, w_used, h_needed = _optimize_layout_for_margin(label, usable_w)
+    w_used = min(w_used, usable_w)
+
+    y0 = max(EDGE_BUFFER, target_y - h_needed / 2.0)
+    y1 = min(pr.height - EDGE_BUFFER, target_y + h_needed / 2.0)
+    if (y1 - y0) < MIN_H:
+        y1 = min(pr.height - EDGE_BUFFER, y0 + MIN_H)
+
+    if side == "left":
+        x1 = x1_lane - 5.0
+        x0 = max(x0_lane, x1 - w_used)
+    else:
+        x0 = x0_lane + 5.0
+        x1 = min(x1_lane, x0 + w_used)
+
+    cand = fitz.Rect(x0, y0, x1, y1)
+
+    # if it overlaps footer, shift up
+    if footer_no_go.width > 0 and footer_no_go.height > 0 and cand.intersects(footer_no_go):
+        shift = (cand.y1 - footer_no_go.y0) + EDGE_BUFFER
+        cand = _shift_rect_up(cand, shift, min_y=EDGE_BUFFER)
+
+    cand = _ensure_min_size(cand, pr)
+    return cand, wrapped_text, fs, False
+
+
+# ============================================================
+# Robust search helpers
 # ============================================================
 
 def _normalize_spaces(s: str) -> str:
@@ -293,22 +503,14 @@ def _normalize_spaces(s: str) -> str:
 
 
 def _search_term(page: fitz.Page, term: str) -> List[fitz.Rect]:
-    """
-    Robust search:
-    1) exact search (with dehyphenate)
-    2) whitespace-normalized search
-    3) chunk fallback for long phrases (line breaks/hyphenation)
-    """
     t = (term or "").strip()
     if not t:
         return []
 
-    # cap extreme length
     if len(t) > _MAX_TERM:
         t = t[:_MAX_TERM]
 
     flags = 0
-    # some PyMuPDF builds provide these
     try:
         flags |= fitz.TEXT_DEHYPHENATE
     except Exception:
@@ -318,7 +520,6 @@ def _search_term(page: fitz.Page, term: str) -> List[fitz.Rect]:
     except Exception:
         pass
 
-    # pass 1: exact
     try:
         rects = page.search_for(t, flags=flags)
         if rects:
@@ -326,7 +527,6 @@ def _search_term(page: fitz.Page, term: str) -> List[fitz.Rect]:
     except Exception:
         pass
 
-    # pass 2: normalized spaces
     t2 = _normalize_spaces(t)
     if t2 and t2 != t:
         try:
@@ -336,7 +536,6 @@ def _search_term(page: fitz.Page, term: str) -> List[fitz.Rect]:
         except Exception:
             pass
 
-    # pass 3: chunk search for long phrases
     if len(t2) >= _CHUNK:
         hits: List[fitz.Rect] = []
         step = max(10, _CHUNK - _CHUNK_OVERLAP)
@@ -345,15 +544,11 @@ def _search_term(page: fitz.Page, term: str) -> List[fitz.Rect]:
             if len(chunk) < 18:
                 continue
             try:
-                rs = page.search_for(chunk, flags=flags)
-                for r in rs:
-                    hits.append(r)
+                hits.extend(page.search_for(chunk, flags=flags))
             except Exception:
                 continue
 
-        # de-dup rectangles
         if hits:
-            # merge close/overlapping
             hits_sorted = sorted(hits, key=lambda r: (r.y0, r.x0))
             merged: List[fitz.Rect] = []
             for r in hits_sorted:
@@ -390,9 +585,7 @@ def annotate_pdf_bytes(
     total_meta_hits = 0
     occupied_callouts: List[fitz.Rect] = []
 
-    # -----------------------------
     # A) Quote highlights (all pages)
-    # -----------------------------
     for page in doc:
         for term in (quote_terms or []):
             rects = _search_term(page, term)
@@ -400,10 +593,7 @@ def annotate_pdf_bytes(
                 page.draw_rect(r, color=RED, width=BOX_WIDTH)
                 total_quote_hits += 1
 
-    # -----------------------------
     # B) Metadata callouts (page 1)
-    # Always attempt whatever values we receive in meta.
-    # -----------------------------
     def _do_job(
         label: str,
         value: Optional[str],
@@ -422,90 +612,70 @@ def annotate_pdf_bytes(
                 if vv:
                     needles.append(vv)
 
-        needles = list(dict.fromkeys(needles))  # de-dupe
+        needles = list(dict.fromkeys(needles))
         if not needles:
             return
 
-        # Find targets on page 1 (try all needles)
         targets: List[fitz.Rect] = []
         for needle in needles:
             try:
-                ts = page1.search_for(needle)
+                targets.extend(page1.search_for(needle))
             except Exception:
-                ts = []
-            if ts:
-                targets.extend(ts)
+                pass
 
         if not targets:
             return
 
-        # Box all target hits
         for t in targets:
             page1.draw_rect(t, color=RED, width=BOX_WIDTH)
         total_meta_hits += len(targets)
 
-        # Place callout
-        callout_rect, wrapped_text, fs, safe = _choose_best_margin_spot(page1, targets, occupied_callouts, label)
+        callout_rect, wrapped_text, fs, safe = _place_annotation_in_margin(
+            page1, targets, occupied_callouts, label
+        )
 
-        # White background only if safe
-        if safe:
-            page1.draw_rect(callout_rect, color=WHITE, fill=WHITE, overlay=True)
+        # Footer no-go shift (belt-and-suspenders)
+        footer_no_go = fitz.Rect(NO_GO_RECT) & page1.rect
+        if footer_no_go.width > 0 and footer_no_go.height > 0 and callout_rect.intersects(footer_no_go):
+            shift = (callout_rect.y1 - footer_no_go.y0) + EDGE_PAD
+            callout_rect = _shift_rect_up(callout_rect, shift, min_y=EDGE_PAD)
 
-        # Thicker-looking text: Times-Bold and slightly larger leading in wrap already handled
-        page1.insert_textbox(
+        # HARD SAFETY: repair + validate before drawing/inserting
+        callout_rect = _ensure_min_size(callout_rect, page1.rect)
+        if not _rect_is_valid(callout_rect):
+            return
+
+        # White backing
+        page1.draw_rect(callout_rect, color=WHITE, fill=WHITE, overlay=True)
+
+        # Text insertion
+        final_rect, ret, final_fs = _insert_textbox_fit(
+            page1,
             callout_rect,
             wrapped_text,
             fontname=FONTNAME,
             fontsize=fs,
             color=RED,
             align=fitz.TEXT_ALIGN_LEFT,
+            overlay=True,
         )
 
-        # Obstacles for “avoid crossing” scoring: other target boxes + existing text blocks
-        obstacles: List[fitz.Rect] = []
-        try:
-            for b in page1.get_text("blocks"):
-                obstacles.append(inflate_rect(fitz.Rect(b[:4]), 1.5))
-        except Exception:
-            pass
-
-        # treat ALL highlighted targets as obstacles EXCEPT the one we're connecting to.
-        expanded_all = [inflate_rect(t, 2.5) for t in targets]
-
-        def connect_to(rect: fitz.Rect):
-            obs = obstacles[:]
-            for ot in expanded_all:
-                # if it's not basically the same rect, keep it as obstacle
-                if not (ot.intersects(rect) and (ot | rect).get_area() < (ot.get_area() + rect.get_area() + 3.0)):
-                    obs.append(ot)
-            for oc in occupied_callouts:
-                obs.append(inflate_rect(oc, 2.0))
-
-            _draw_straight_connector(page1, callout_rect, rect, obs)
-
+        # Connectors
+        target_union = _union_rect(targets)
         if connect_policy == "all":
             for t in targets:
-                connect_to(t)
+                _draw_connector(page1, final_rect, t)
         elif connect_policy == "single":
-            connect_to(targets[0])
+            _draw_connector(page1, final_rect, targets[0])
         else:
-            connect_to(_union_rect(targets))
+            _draw_connector(page1, final_rect, target_union)
 
-        occupied_callouts.append(callout_rect)
+        occupied_callouts.append(final_rect)
 
-    # Always do URL if present
     _do_job("Original source of publication.", meta.get("source_url"), connect_policy="union")
-
-    # Venue / org name
     _do_job("The distinguished organization.", meta.get("venue_name") or meta.get("org_name"), connect_policy="union")
-
-    # Date
     _do_job("Performance date.", meta.get("performance_date"), connect_policy="union")
-
-    # Salary
     _do_job("Beneficiary salary evidence.", meta.get("salary_amount"), connect_policy="union")
-
-    # Beneficiary name (try variants too) – connect to all hits (straight lines)
     _do_job(
         "Beneficiary lead role evidence.",
         meta.get("beneficiary_name"),
